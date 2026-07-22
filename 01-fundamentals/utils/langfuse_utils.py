@@ -10,7 +10,7 @@ from botocore.exceptions import ClientError
 from langfuse import get_client, observe
 from langfuse.model import PromptClient
 
-langfuse_context = get_client()
+langfuse = get_client()
 
 MODEL_CONFIG = {
     "sonnet": {
@@ -97,7 +97,7 @@ def converse(
         **kwargs_clone.pop("additionalModelRequestFields", {}),
         **kwargs_clone.pop("guardrailConfig", {}),
     }
-    langfuse_context.update_current_generation(
+    langfuse.update_current_generation(
         input=messages,
         model=model_id,
         model_parameters=model_parameters,
@@ -115,12 +115,12 @@ def converse(
         )
     except (ClientError, Exception) as e:
         error_message = f"ERROR: Can't invoke '{model_id}'. Reason: {e}"
-        langfuse_context.update_current_generation(level="ERROR", status_message=error_message)
+        langfuse.update_current_generation(level="ERROR", status_message=error_message)
         print(error_message)
         return
 
     response_text = response["output"]["message"]["content"][0]["text"]
-    langfuse_context.update_current_generation(
+    langfuse.update_current_generation(
         output=response_text,
         usage_details={
             "input": response["usage"]["inputTokens"],
@@ -155,7 +155,7 @@ def converse_tool_use(
         **kwargs_clone.pop("guardrailConfig", {}),
     }
 
-    langfuse_context.update_current_generation(
+    langfuse.update_current_generation(
         input={"messages": messages, "tools": tools, "tool_choice": tool_choice},
         model=model_id,
         model_parameters=model_parameters,
@@ -195,7 +195,7 @@ def converse_tool_use(
         )
     except (ClientError, Exception) as e:
         error_message = f"ERROR: Can't invoke '{model_id}'. Reason: {e}"
-        langfuse_context.update_current_generation(level="ERROR", status_message=error_message)
+        langfuse.update_current_generation(level="ERROR", status_message=error_message)
         print(error_message)
         return
 
@@ -218,7 +218,7 @@ def converse_tool_use(
                     }
                 )
 
-    langfuse_context.update_current_generation(
+    langfuse.update_current_generation(
         output=tool_calls,
         usage_details={
             "input": response["usage"]["inputTokens"],
@@ -243,7 +243,7 @@ def converse_tool_use(
 
 @observe(as_type="span", name="Tool Execution")
 def _execute_tool_span(tool_id: str, tool_name: str, tool_input: str) -> dict:
-    langfuse_context.update_current_span(
+    langfuse.update_current_span(
         input={"tool_id": tool_id, "tool_name": tool_name, "arguments": tool_input},
         output={"status": "completed", "result": json.loads(tool_input)},
         metadata={"tool_name": tool_name},
