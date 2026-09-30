@@ -1,0 +1,86 @@
+{
+  "source": "03-developer-journey/agents/gateway_lambda.py; schemas from utils/tools.py via gateway_setup.tool_schema (read-only subset)",
+  "function_sha256": {
+    "get_return_policy": "7d395df8b615ae92d57381360199a60b4c0d63733646347744acbc758ac2ed03",
+    "get_product_info": "0b70395cd0ea340d6d8814773e67a72d2fc5aa8b45b29b3693576eafd710f403"
+  },
+  "tools": [
+    {
+      "name": "get_return_policy",
+      "description": "Get return policy information for a specific product category.\n\nReturns:\n    Detailed return policy information for the specified category",
+      "inputSchema": {
+        "properties": {
+          "product_category": {
+            "description": "The category of product (e.g., 'smartphones', 'laptops', 'accessories')",
+            "type": "string"
+          }
+        },
+        "required": [
+          "product_category"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_product_info",
+      "description": "Get detailed technical specifications for electronics products.\n\nReturns:\n    Detailed product specifications and features",
+      "inputSchema": {
+        "properties": {
+          "product_type": {
+            "description": "The type of product (e.g., 'laptops', 'smartphones', 'tablets')",
+            "type": "string"
+          }
+        },
+        "required": [
+          "product_type"
+        ],
+        "type": "object"
+      }
+    }
+  ],
+  "laptop_results": {
+    "get_return_policy": "Return Policy - Laptops:\n\n- Return Window: 30 days\n- Condition Requirements: Original packaging, all accessories included, no physical damage\n- Return Process: Online RMA portal or in-store return\n- Refund Timeline: 7-10 business days after inspection\n- Shipping: Free return shipping for defects, customer pays for change of mind\n- Warranty: 1-year manufacturer warranty, extended warranty available\n- Restocking Fee: None for defects, 15% for change of mind\n\nFor assistance with returns, visit our online RMA portal or contact customer support.",
+    "get_product_info": "TechMart Pro 15 - $1,299\n\nSpecifications:\n  - Processor: Intel Core i7-13700H (14 cores, up to 5.0GHz)\n  - Memory: 16GB DDR5 RAM (upgradeable to 32GB)\n  - Storage: 512GB NVMe SSD (expandable)\n  - Display: 15.6\" FHD IPS, 144Hz refresh rate, 300 nits\n  - Graphics: NVIDIA RTX 4060 6GB\n  - Battery: 72Wh, up to 10 hours\n  - Weight: 4.5 lbs (2.04 kg)\n  - Ports: 2x USB-C, 2x USB-A, HDMI 2.1, SD card reader\n\nAvailable Colors: Space Gray, Silver, Midnight Blue\nIn Stock: Yes\nDelivery: 2-3 business days\n\nContact sales for bulk orders or custom configurations."
+  },
+  "cases": [
+    {
+      "id": "laptop-multi",
+      "query": "Look up the laptop product and return policy. Return only JSON with product (featured model name), return_window_days (integer), and approved (false). This is an information request, not a return authorization.",
+      "required_calls": {
+        "get_product_info": {
+          "product_type": "laptops"
+        },
+        "get_return_policy": {
+          "product_category": "laptops"
+        }
+      },
+      "expected": {
+        "product": "TechMart Pro 15",
+        "return_window_days": 30,
+        "approved": false
+      }
+    },
+    {
+      "id": "laptop-policy",
+      "query": "Look up the laptop return policy. Return only JSON with return_window_days (integer) and approved (false). Do not approve a return.",
+      "required_calls": {
+        "get_return_policy": {
+          "product_category": "laptops"
+        }
+      },
+      "expected": {
+        "return_window_days": 30,
+        "approved": false
+      }
+    },
+    {
+      "id": "greeting-no-tool",
+      "query": "No product or policy lookup is needed. Reply with exactly this JSON: {\"message\":\"Hello!\",\"approved\":false}",
+      "required_calls": {},
+      "expected": {
+        "message": "Hello!",
+        "approved": false
+      }
+    }
+  ]
+}

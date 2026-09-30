@@ -1,32 +1,625 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'CloudFormation template for Customer Support System with DynamoDB tables, SSM parameters, and synthetic data'
-Metadata:
-  AWS::CloudFormation::Interface:
-    ParameterGroups:
-      - Label:
-          default: Lambda Code Configuration
-        Parameters:
-          - LambdaS3Bucket
-          - LambdaS3Key
-          
-Parameters:
+Description: 'Customer support workshop: native knowledge bases, AgentCore roles and gateway, observability, and sample data'
 
-  LambdaS3Bucket:
-    Description: The name of S3 bucket which contains lambda code
-    Type: String
-    MinLength: 1
-  
-  LambdaS3Key:
-    Description: The S3 object key which contains customer support assistant code in zip format
-    Type: String
-    MinLength: 1
-    
-  LayerS3Key:
-    Type: String
-    Description: 'S3 key for the DDGS layer zip file'
-    MinLength: 1
-    
+# Native KB/DataSource resources own their lifecycle through CloudFormation.
+# Developer Journey uses Managed KB; Playbook retains S3 Vectors for its tuning labs.
+# Targets, online evaluations, bundles and A/B jobs follow notebook Runtime deployment.
+# Existing custom-resource stacks require the staged migration described below.
+Metadata:
+  RuntimeGatewayContract:
+    VerifiedOn: '2026-09-24'
+    Source: https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-target-http-runtime.html
+    Protocol: HTTP Runtime targets require ProtocolType to be omitted.
+  ManagedKnowledgeBaseContract:
+    VerifiedOn: '2026-09-24'
+    SchemaRegion: us-east-1
+    SchemaReadOperation: cloudformation:DescribeType
+    Sources:
+    - https://docs.aws.amazon.com/bedrock/latest/userguide/kb-managed-create.html
+    - https://docs.aws.amazon.com/bedrock/latest/userguide/kb-managed-ds-s3.html
+    - https://docs.aws.amazon.com/bedrock/latest/userguide/kb-managed-connect-ds.html
+    - https://docs.aws.amazon.com/bedrock/latest/userguide/kb-managed-sync.html
+    - https://docs.aws.amazon.com/bedrock/latest/userguide/kb-managed-customize-ingestion.html
+    - https://docs.aws.amazon.com/bedrock/latest/userguide/kb-managed-prereqs.html
+    Connector: >-
+      ConnectorParameters is an opaque JSON object in the CFN schema. Its keys
+      must remain lower camel case: type=S3, version="1",
+      connectionConfiguration.bucketName and bucketOwnerAccountId.
+      DeletionProtectionConfiguration is a typed sibling outside that object.
+    Ingestion: >-
+      Both KB types use bedrock-agent StartIngestionJob, GetIngestionJob and
+      StopIngestionJob. Native CFN resources stabilize the KB and data source;
+      the shared custom resource uploads nothing and only syncs their exact IDs.
+      Managed parsing defaults to SMART_PARSING. With managed embeddings the
+      service controls chunking; omit ChunkingConfiguration. Rebaseline retrieval
+      after migration instead of assuming the old 200-token chunks remain.
+      No recurring sync schedule or custom embedding-model access is required.
+  WorkshopMigration:
+    FreshInstall: >-
+      Deploy this template in a clean environment. Native resources own the KBs,
+      sources, vector storage, memory and layer versions. SSM IDs and KB type are
+      published only after successful ingestion. Do not apply this template
+      directly to a stack that still uses the legacy provisioning handlers.
+    LegacyCustomResourceUpgrade:
+    - >-
+      Freeze notebook writes. Save the old template, stack resource IDs, outputs
+      and SSM values. Build an explicit ownership manifest for both KB IDs,
+      their data source IDs, vector bucket/index ARNs, memory ID and all layer
+      version ARNs published by that stack. Read each KB's storage and service
+      role to verify ownership; names alone are not ownership evidence. The old
+      handlers could fail after creating resources but before publishing SSM,
+      so reconcile their logs and creation history as well as current SSM.
+    - >-
+      Use a separately reviewed bridge update before repointing any SSM values:
+      make the old KB, memory and layer handlers non-mutating during the handoff.
+      The old memory Delete handler looks up its deletion target through SSM;
+      without this bridge it can delete the replacement memory after cutover.
+      Do not remove the old service roles or their vector permissions yet.
+    - >-
+      Import the inventoried resources into explicit native ownership in separate
+      IMPORT change sets, using their current properties and temporary
+      DeletionPolicy/UpdateReplacePolicy Retain. Import the old Developer Journey
+      KB and vectors as Legacy resources; import the Playbook KB, source, vectors
+      and memory under the intended final logical IDs where possible. Already
+      native S3 buckets and IAM roles remain in their current stack. Import the
+      four existing KB/data-source SSM parameters and memory_id before using
+      this template's native parameters; never overwrite or adopt them by name.
+      A resource already managed by another stack must not be imported twice.
+    - >-
+      In a reviewed staged UPDATE, create the distinctly named managed KB and
+      source, upload and ingest the six documents, then verify managed retrieval
+      before repointing the existing Developer Journey SSM IDs and kb/type.
+      Keep the imported legacy KBs, indexes, original roles and manifest through
+      this check so rollback remains possible. Apply the remaining template
+      changes only after all imports and references have been reconciled.
+    - >-
+      After cutover is validated, retire only manifest-owned obsolete resources:
+      old data sources (DataDeletionPolicy DELETE), then their KBs, vector
+      indexes and empty vector buckets; retire superseded memory and unused
+      layer versions only after their consumers have moved. Prefer reviewed
+      native resource removals with DeletionPolicy/UpdateReplacePolicy Delete;
+      any resource not importable needs an explicit ID-scoped retirement step.
+      Remove legacy service roles last. Restore normal Delete policies for the
+      final native resources and reconcile every manifest entry as still managed
+      or deleted before closing migration. Retain is a temporary rollback aid,
+      not permission to leave untracked orphans. Never run account-wide cleanup.
+    ImportIdentifiers:
+      AWS::Bedrock::KnowledgeBase: KnowledgeBaseId
+      AWS::Bedrock::DataSource: KnowledgeBaseId and DataSourceId
+      AWS::S3Vectors::VectorBucket: VectorBucketArn
+      AWS::S3Vectors::Index: IndexArn
+      AWS::SSM::Parameter: Name
+    ImportReference: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/resource-import-supported-resources.html
+    NativeVectorDraftUpgrade: >-
+      If the intermediate native VECTOR draft was deployed, CFN replaces the
+      Developer Journey KB/source when Type changes. Stage the managed creation,
+      ingestion and SSM cutover before retiring its native vector index/bucket;
+      preserve the old Bedrock service role's vector permissions until its old
+      data source has been deleted. Do not combine that retirement with an
+      unreviewed blanket update. The Managed KB cannot be converted in place.
+    ExecutionBoundary: >-
+      These are migration instructions, not an automatic migration. This
+      template's handlers never enumerate or adopt legacy resources, and no
+      migration, import or resource deletion was executed while authoring it.
 Resources:
+
+  LambdaCodeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'lambda-code-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+      - Key: Application
+        Value: CustomerSupport
+      - Key: WorkshopStack
+        Value: !Ref 'AWS::StackId'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: AES256
+
+  LambdaCodeSetupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3WritePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub '${LambdaCodeBucket.Arn}/*'
+
+  # Custom Resource Lambda to download and upload Lambda code
+  LambdaCodeSetupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaCodeSetupRole.Arn
+      Timeout: 900
+      MemorySize: 1024
+      EphemeralStorage:
+        Size: 2048
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import zipfile
+          import io
+          import os
+          import sys
+          import subprocess
+          import tempfile
+
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  bucket_name = event['ResourceProperties']['BucketName']
+                  artifact_revision = event['ResourceProperties']['ArtifactRevision']
+                  lambda_key = f'lambda-{artifact_revision}.zip'
+                  s3 = boto3.client('s3')
+
+                  # Build ddgs-layer.zip by pip-installing ddgs into a Lambda layer
+                  # layout (python/ prefix). We build it here rather than downloading a
+                  # prebuilt zip so the stack has no external (GitHub) runtime dependency.
+                  with tempfile.TemporaryDirectory() as temp_dir:
+                      python_dir = os.path.join(temp_dir, 'python')
+                      os.makedirs(python_dir)
+                      # Force Linux x86_64 wheels (ddgs pulls compiled deps: lxml,
+                      # primp, brotli) so the layer matches the python3.12 x86_64 runtime,
+                      # regardless of where pip happens to run.
+                      subprocess.check_call([
+                          sys.executable, '-m', 'pip', 'install',
+                          'ddgs==9.14.4',
+                          '--target', python_dir, '--no-cache-dir',
+                          '--platform', 'manylinux2014_x86_64',
+                          '--python-version', '3.12',
+                          '--implementation', 'cp',
+                          '--only-binary=:all:',
+                      ])
+                      layer_buf = io.BytesIO()
+                      with zipfile.ZipFile(layer_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+                          for root, _dirs, files in os.walk(python_dir):
+                              for fname in files:
+                                  fpath = os.path.join(root, fname)
+                                  arcname = os.path.relpath(fpath, temp_dir)
+                                  zf.write(fpath, arcname)
+                      layer_buf.seek(0)
+                      s3.put_object(Bucket=bucket_name, Key='ddgs-layer.zip', Body=layer_buf.read())
+                  print("Built and uploaded ddgs-layer.zip")
+
+                  # Create the revisioned Lambda artifact with inline code
+                  lambda_code = io.BytesIO()
+                  with zipfile.ZipFile(lambda_code, 'w', zipfile.ZIP_DEFLATED) as zf:
+                      # lambda_function.py
+                      zf.writestr('lambda_function.py', '''from check_warranty import check_warranty_status
+          from web_search import web_search
+          from support_info import get_return_policy, get_product_info
+
+
+          def get_named_parameter(event, name):
+              if name not in event:
+                  return None
+              return event.get(name)
+
+
+          def lambda_handler(event, context):
+              print(f"Event: {event}")
+              print(f"Context: {context}")
+
+              extended_tool_name = context.client_context.custom["bedrockAgentCoreToolName"]
+              resource = extended_tool_name.rsplit("___", 1)[-1]
+
+              print(resource)
+
+              read_only_functions = {
+                  "get_return_policy": get_return_policy,
+                  "get_product_info": get_product_info,
+              }
+              if resource in read_only_functions:
+                  try:
+                      return {"statusCode": 200, "body": read_only_functions[resource](**event)}
+                  except TypeError:
+                      return {"statusCode": 400, "body": "Invalid or missing tool arguments"}
+
+              if resource == "check_warranty_status":
+                  serial_number = get_named_parameter(event=event, name="serial_number")
+                  customer_email = get_named_parameter(event=event, name="customer_email")
+
+                  if not serial_number:
+                      return {"statusCode": 400, "body": "Please provide serial_number"}
+
+                  try:
+                      warranty_status = check_warranty_status(
+                          serial_number=serial_number, customer_email=customer_email
+                      )
+                  except Exception as e:
+                      print(e)
+                      return {"statusCode": 400, "body": f"{e}"}
+
+                  return {"statusCode": 200, "body": warranty_status}
+
+              elif resource == "web_search":
+                  keywords = get_named_parameter(event=event, name="keywords")
+                  region = get_named_parameter(event=event, name="region") or "us-en"
+                  max_results = get_named_parameter(event=event, name="max_results") or 5
+
+                  if not keywords:
+                      return {"statusCode": 400, "body": "Please provide keywords for search"}
+
+                  try:
+                      search_results = web_search(
+                          keywords=keywords, region=region, max_results=int(max_results)
+                      )
+                  except Exception as e:
+                      print(e)
+                      return {"statusCode": 400, "body": f"{e}"}
+
+                  return {"statusCode": 200, "body": f"Search Results: {search_results}"}
+
+              return {"statusCode": 400, "body": f"Unknown toolname: {resource}"}
+          ''')
+
+                      # Pure read-only operations copied from Journey's canonical gateway handler.
+                      zf.writestr('support_info.py', r'''def get_return_policy(product_category: str) -> str:
+              """Get return policy information for a specific product category.
+
+              Args:
+                  product_category: The category of product (e.g., 'smartphones', 'laptops', 'accessories')
+
+              Returns:
+                  Detailed return policy information for the specified category
+              """
+              return_policies = {
+                  "smartphones": {
+                      "window": "30 days",
+                      "condition": "Original packaging, no physical damage, factory reset required",
+                      "process": "Online RMA portal or technical support",
+                      "refund_time": "5-7 business days after inspection",
+                      "shipping": "Free return shipping, prepaid label provided",
+                      "warranty": "1-year manufacturer warranty included",
+                      "restocking_fee": "None for unopened, 15% for opened items",
+                  },
+                  "laptops": {
+                      "window": "30 days",
+                      "condition": "Original packaging, all accessories included, no physical damage",
+                      "process": "Online RMA portal or in-store return",
+                      "refund_time": "7-10 business days after inspection",
+                      "shipping": "Free return shipping for defects, customer pays for change of mind",
+                      "warranty": "1-year manufacturer warranty, extended warranty available",
+                      "restocking_fee": "None for defects, 15% for change of mind",
+                  },
+                  "accessories": {
+                      "window": "60 days",
+                      "condition": "Unopened original packaging preferred, opened items accepted",
+                      "process": "Online RMA portal, mail-in, or in-store",
+                      "refund_time": "3-5 business days after inspection",
+                      "shipping": "Free return shipping on orders over $50",
+                      "warranty": "90-day manufacturer warranty",
+                      "restocking_fee": "None",
+                  },
+                  "tablets": {
+                      "window": "30 days",
+                      "condition": "Original packaging, factory reset, no physical damage",
+                      "process": "Online RMA portal or technical support",
+                      "refund_time": "5-7 business days after inspection",
+                      "shipping": "Free return shipping, prepaid label provided",
+                      "warranty": "1-year manufacturer warranty included",
+                      "restocking_fee": "None for unopened, 10% for opened items",
+                  },
+                  "audio": {
+                      "window": "45 days",
+                      "condition": "Original packaging, all accessories included",
+                      "process": "Online RMA portal or in-store",
+                      "refund_time": "5-7 business days after inspection",
+                      "shipping": "Free return shipping",
+                      "warranty": "1-year manufacturer warranty",
+                      "restocking_fee": "None",
+                  },
+              }
+
+              default_policy = {
+                  "window": "30 days",
+                  "condition": "Original packaging, undamaged condition",
+                  "process": "Contact customer support for RMA",
+                  "refund_time": "7-10 business days after inspection",
+                  "shipping": "Varies by product",
+                  "warranty": "Standard manufacturer warranty",
+                  "restocking_fee": "May apply",
+              }
+
+              policy = return_policies.get(product_category.lower(), default_policy)
+              category_name = product_category.title()
+
+              return f"""Return Policy - {category_name}:
+
+          - Return Window: {policy["window"]}
+          - Condition Requirements: {policy["condition"]}
+          - Return Process: {policy["process"]}
+          - Refund Timeline: {policy["refund_time"]}
+          - Shipping: {policy["shipping"]}
+          - Warranty: {policy["warranty"]}
+          - Restocking Fee: {policy["restocking_fee"]}
+
+          For assistance with returns, visit our online RMA portal or contact customer support."""
+
+
+          def get_product_info(product_type: str) -> str:
+              """Get detailed technical specifications for electronics products.
+
+              Args:
+                  product_type: The type of product (e.g., 'laptops', 'smartphones', 'tablets')
+
+              Returns:
+                  Detailed product specifications and features
+              """
+              products = {
+                  "laptops": {
+                      "featured_model": "TechMart Pro 15",
+                      "price": "$1,299",
+                      "specs": {
+                          "processor": "Intel Core i7-13700H (14 cores, up to 5.0GHz)",
+                          "memory": "16GB DDR5 RAM (upgradeable to 32GB)",
+                          "storage": "512GB NVMe SSD (expandable)",
+                          "display": '15.6" FHD IPS, 144Hz refresh rate, 300 nits',
+                          "graphics": "NVIDIA RTX 4060 6GB",
+                          "battery": "72Wh, up to 10 hours",
+                          "weight": "4.5 lbs (2.04 kg)",
+                          "ports": "2x USB-C, 2x USB-A, HDMI 2.1, SD card reader",
+                      },
+                      "colors": ["Space Gray", "Silver", "Midnight Blue"],
+                      "in_stock": True,
+                      "delivery": "2-3 business days",
+                  },
+                  "smartphones": {
+                      "featured_model": "TechMart Phone X",
+                      "price": "$899",
+                      "specs": {
+                          "processor": "Snapdragon 8 Gen 2",
+                          "memory": "8GB RAM",
+                          "storage": "256GB (no expansion)",
+                          "display": '6.7" AMOLED, 120Hz, 2400x1080',
+                          "camera": "50MP main + 12MP ultrawide + 10MP telephoto",
+                          "battery": "5000mAh, 65W fast charging",
+                          "os": "Android 14",
+                          "connectivity": "5G, Wi-Fi 6E, Bluetooth 5.3",
+                      },
+                      "colors": ["Obsidian Black", "Pearl White", "Ocean Blue"],
+                      "in_stock": True,
+                      "delivery": "1-2 business days",
+                  },
+                  "tablets": {
+                      "featured_model": "TechMart Tab Pro",
+                      "price": "$649",
+                      "specs": {
+                          "processor": "Apple M2 chip",
+                          "memory": "8GB RAM",
+                          "storage": "128GB / 256GB / 512GB options",
+                          "display": '11" Liquid Retina, 120Hz ProMotion',
+                          "camera": "12MP rear + 12MP front with Center Stage",
+                          "battery": "Up to 10 hours",
+                          "connectivity": "Wi-Fi 6E, optional 5G",
+                          "accessories": "Compatible with Magic Keyboard and Apple Pencil",
+                      },
+                      "colors": ["Silver", "Space Gray"],
+                      "in_stock": True,
+                      "delivery": "2-3 business days",
+                  },
+                  "audio": {
+                      "featured_model": "TechMart SoundPro Headphones",
+                      "price": "$349",
+                      "specs": {
+                          "type": "Over-ear wireless",
+                          "driver": "40mm custom drivers",
+                          "anc": "Active Noise Cancellation with transparency mode",
+                          "battery": "30 hours (ANC on), 40 hours (ANC off)",
+                          "connectivity": "Bluetooth 5.2, 3.5mm jack",
+                          "features": "Multipoint connection, spatial audio",
+                          "weight": "250g",
+                          "charging": "USB-C, 10min charge = 3 hours playback",
+                      },
+                      "colors": ["Midnight Black", "Cloud White", "Forest Green"],
+                      "in_stock": True,
+                      "delivery": "1-2 business days",
+                  },
+                  "accessories": {
+                      "featured_items": [
+                          {"name": "USB-C Hub 7-in-1", "price": "$49", "in_stock": True},
+                          {"name": "Wireless Charging Pad", "price": "$29", "in_stock": True},
+                          {"name": "Laptop Stand Adjustable", "price": "$39", "in_stock": True},
+                          {"name": "Screen Protector Kit", "price": "$19", "in_stock": True},
+                          {"name": "Premium Laptop Bag", "price": "$79", "in_stock": True},
+                      ],
+                      "delivery": "1-2 business days",
+                  },
+              }
+
+              product = products.get(product_type.lower())
+
+              if not product:
+                  return f"Product type '{product_type}' not found. Available categories: {', '.join(products.keys())}"
+
+              if product_type.lower() == "accessories":
+                  items_list = "\n".join([f"  - {item['name']}: {item['price']}" for item in product["featured_items"]])
+                  return f"""Accessories Collection:
+
+          Featured Items:
+          {items_list}
+
+          Delivery: {product["delivery"]}
+
+          All accessories come with a 90-day warranty."""
+
+              specs_list = "\n".join([f"  - {k.title()}: {v}" for k, v in product["specs"].items()])
+              colors_list = ", ".join(product.get("colors", []))
+
+              return f"""{product["featured_model"]} - {product["price"]}
+
+          Specifications:
+          {specs_list}
+
+          Available Colors: {colors_list}
+          In Stock: {"Yes" if product["in_stock"] else "No"}
+          Delivery: {product["delivery"]}
+
+          Contact sales for bulk orders or custom configurations."""
+          ''')
+
+                      # check_warranty.py
+                      zf.writestr('check_warranty.py', '''import boto3
+          import json
+          from datetime import datetime
+          from botocore.exceptions import ClientError
+          import logging
+          import re
+
+          logging.basicConfig(format="[%(asctime)s] p%(process)s {%(filename)s:%(lineno)d} %(levelname)s - %(message)s", level=logging.INFO)
+          logger = logging.getLogger(__name__)
+
+          dynamodb = boto3.resource("dynamodb")
+          smm_client = boto3.client("ssm")
+
+          warranty_table = smm_client.get_parameter(Name="/app/customersupport/dynamodb/warranty_table_name", WithDecryption=False)
+          warranty_table_name = warranty_table["Parameter"]["Value"]
+
+
+          def ensure_warranty_table_exists():
+              try:
+                  table = dynamodb.Table(warranty_table_name)
+                  table.load()
+                  return table
+              except ClientError as e:
+                  raise e
+
+
+          def validate_serial_number(serial_number: str) -> bool:
+              pattern = r"^[A-Z0-9]{8,20}$"
+              return bool(re.match(pattern, serial_number.upper()))
+
+
+          def calculate_days_remaining(end_date: str) -> int:
+              try:
+                  end_date_obj = datetime.strptime(end_date, "%Y-%m-%d")
+                  today = datetime.now()
+                  delta = end_date_obj - today
+                  return delta.days
+              except ValueError:
+                  return 0
+
+
+          def get_warranty_status_text(days_remaining: int) -> str:
+              if days_remaining > 30:
+                  return "Active"
+              elif days_remaining > 0:
+                  return "Expiring Soon"
+              else:
+                  return "Expired"
+
+
+          def check_warranty_status(serial_number: str, customer_email: str = None) -> str:
+              logger.info(json.dumps({"serial_number": serial_number, "customer_email": customer_email, "timestamp": datetime.now().isoformat()}, indent=2, default=str))
+
+              if not validate_serial_number(serial_number):
+                  raise ValueError("Serial number must be 8-20 alphanumeric characters")
+
+              serial_number = serial_number.upper()
+
+              try:
+                  table = ensure_warranty_table_exists()
+                  response = table.get_item(Key={"serial_number": serial_number})
+
+                  if "Item" not in response:
+                      return f"Warranty Not Found for Serial Number: {serial_number}"
+
+                  warranty_item = response["Item"]
+                  product_name = warranty_item.get("product_name", "Unknown Product")
+                  purchase_date = warranty_item.get("purchase_date", "Unknown")
+                  warranty_end_date = warranty_item.get("warranty_end_date", "Unknown")
+                  warranty_type = warranty_item.get("warranty_type", "Standard")
+                  customer_name = warranty_item.get("customer_name", "Unknown")
+                  coverage_details = warranty_item.get("coverage_details", "Standard coverage applies")
+
+                  days_remaining = calculate_days_remaining(warranty_end_date) if warranty_end_date != "Unknown" else 0
+                  status_text = get_warranty_status_text(days_remaining)
+
+                  warranty_info = [
+                      "Warranty Status Information",
+                      "===============================",
+                      f"Product: {product_name}",
+                      f"Serial Number: {serial_number}",
+                      f"Customer: {customer_name}",
+                      f"Purchase Date: {purchase_date}",
+                      f"Warranty End Date: {warranty_end_date}",
+                      f"Warranty Type: {warranty_type}",
+                      f"Status: {status_text}",
+                      f"Days Remaining: {days_remaining}",
+                      f"Coverage Details: {coverage_details}",
+                  ]
+
+                  logger.info(json.dumps(warranty_item, indent=2, default=str))
+                  return "\\n".join(warranty_info)
+
+              except ClientError as e:
+                  logger.error("DynamoDB Error:", e)
+                  raise Exception(f"Failed to check warranty status: {e.response['Error']['Message']}")
+              except Exception as e:
+                  logger.error("Unexpected Error:", str(e))
+                  raise Exception(f"Failed to check warranty status: {str(e)}")
+          ''')
+
+                      # web_search.py
+                      zf.writestr('web_search.py', '''from ddgs import DDGS
+
+
+          def web_search(keywords: str, region: str = "us-en", max_results: int = 5) -> str:
+              try:
+                  results = DDGS().text(keywords, region=region, max_results=max_results)
+                  return results if results else "No results found."
+              except Exception as e:
+                  return f"Search error: {str(e)}"
+          ''')
+
+                  lambda_code.seek(0)
+                  s3.put_object(Bucket=bucket_name, Key=lambda_key, Body=lambda_code.read())
+                  print(f"Uploaded {lambda_key}")
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'LambdaS3Key': lambda_key,
+                      'LayerS3Key': 'ddgs-layer.zip'
+                  }, physicalResourceId=event.get('PhysicalResourceId') or f'{bucket_name}-lambda-code')
+
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  # Trigger Lambda Code Setup
+  LambdaCodeSetup:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: WorkshopBucketCleanup
+    Properties:
+      ServiceToken: !GetAtt 'LambdaCodeSetupFunction.Arn'
+      BucketName: !Ref 'LambdaCodeBucket'
+      # Bump for bootstrap code changes: rerun setup and change the Lambda Code S3 key.
+      ArtifactRevision: high-readonly-v1
 
   RuntimeAgentCoreRole:
     Type: AWS::IAM::Role
@@ -34,138 +627,183 @@ Resources:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
-          - Effect: Allow
-            Principal:
-              Service:
-                - bedrock-agentcore.amazonaws.com
-            Action:
-              - sts:AssumeRole
+        - Effect: Allow
+          Principal:
+            Service:
+            - bedrock-agentcore.amazonaws.com
+          Action:
+          - sts:AssumeRole
       Policies:
-        - PolicyName: BedrockAgentPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Sid: ECRImageAccess
-                Effect: Allow
-                Action:
-                  - ecr:BatchGetImage
-                  - ecr:GetDownloadUrlForLayer
-                Resource:
-                  - !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/bedrock_agentcore-customersupport*
-              - Effect: Allow
-                Action:
-                  - logs:DescribeLogStreams
-                  - logs:CreateLogGroup
-                Resource:
-                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*
-              - Effect: Allow
-                Action:
-                  - logs:DescribeLogGroups
-                Resource:
-                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*
-              - Effect: Allow
-                Action:
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource:
-                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*:log-stream:*
-              - Sid: ECRTokenAccess
-                Effect: Allow
-                Action:
-                  - ecr:GetAuthorizationToken
-                Resource: "*"
-              - Effect: Allow
-                Action:
-                  - xray:PutTraceSegments
-                  - xray:PutTelemetryRecords
-                  - xray:GetSamplingRules
-                  - xray:GetSamplingTargets
-                Resource: "*"
-              - Effect: Allow
-                Action:
-                  - cloudwatch:PutMetricData
-                Resource: "*"
-                Condition:
-                  StringEquals:
-                    cloudwatch:namespace: bedrock-agentcore
-              - Sid: GetAgentAccessToken
-                Effect: Allow
-                Action:
-                  - bedrock-agentcore:GetWorkloadAccessToken
-                  - bedrock-agentcore:GetWorkloadAccessTokenForJWT
-                  - bedrock-agentcore:GetWorkloadAccessTokenForUserId
-                Resource:
-                  - !Sub arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default
-                  - !Sub arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/customersupport*
-              - Sid: ProvisionedThroughputModelInvocation
-                Effect: Allow
-                Action:
-                  - bedrock:InvokeModel
-                  - bedrock:InvokeModelWithResponseStream
-                Resource:
-                  - "arn:aws:bedrock:*::foundation-model/*"
-                  - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:*
-              - Sid: SSMGetparam
-                Effect: Allow
-                Action:
-                  - ssm:GetParameter
-                Resource:
-                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/app/customersupport/*
-              - Sid: Identity
-                Effect: Allow
-                Action:
-                  - bedrock-agentcore:GetResourceOauth2Token
-                Resource:
-                  - !Sub arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:token-vault/default/oauth2credentialprovider/customersupport*
-                  - !Sub arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/customersupport*
-                  - !Sub arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default
-                  - !Sub arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:token-vault/default
-              - Sid: SecretManager
-                Effect: Allow
-                Action:
-                  - secretsmanager:GetSecretValue
-                Resource:
-                  - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:bedrock-agentcore-identity!default/oauth2/customersupport*
-              - Sid: AgentCoreMemory
-                Effect: Allow
-                Action:
-                  - bedrock-agentcore:ListMemories
-                  - bedrock-agentcore:ListMemoryRecords
-                  - bedrock-agentcore:RetrieveMemoryRecords
-                  - bedrock-agentcore:GetMemory
-                  - bedrock-agentcore:GetMemoryRecord
-                  - bedrock-agentcore:CreateEvent
-                  - bedrock-agentcore:GetEvent
-                Resource:
-                  - !Sub arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:memory/customersupport*
+      - PolicyName: BedrockAgentPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:DescribeLogStreams
+            - logs:CreateLogGroup
+            Resource:
+            - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*'
+          - Effect: Allow
+            Action:
+            - logs:DescribeLogGroups
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource:
+            - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*:log-stream:*'
+          - Effect: Allow
+            Action:
+            - xray:PutSpans
+            - xray:PutTraceSegments
+            - xray:PutTelemetryRecords
+            - xray:GetSamplingRules
+            - xray:GetSamplingTargets
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - cloudwatch:PutMetricData
+            Resource: '*'
+            Condition:
+              StringEquals:
+                cloudwatch:namespace: bedrock-agentcore
+          - Sid: GetAgentAccessToken
+            Effect: Allow
+            Action:
+            - bedrock-agentcore:GetWorkloadAccessToken
+            - bedrock-agentcore:GetWorkloadAccessTokenForJWT
+            - bedrock-agentcore:GetWorkloadAccessTokenForUserId
+            Resource:
+            - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default'
+            - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/customersupport*'
+          - Sid: ProvisionedThroughputModelInvocation
+            Effect: Allow
+            Action:
+            - bedrock:InvokeModel
+            - bedrock:InvokeModelWithResponseStream
+            Resource:
+            - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/*'
+            - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*'
+            - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:application-inference-profile/*'
+          - Sid: SSMGetparam
+            Effect: Allow
+            Action:
+            - ssm:GetParameter
+            Resource:
+            - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/app/customersupport/*'
+            - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::AccountId}-${AWS::Region}/kb/*'
+            - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::AccountId}-${AWS::Region}/playbook-kb/*'
+          - Sid: Identity
+            Effect: Allow
+            Action:
+            - bedrock-agentcore:GetResourceOauth2Token
+            Resource:
+            - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:token-vault/default/oauth2credentialprovider/customersupport*'
+            - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/customersupport*'
+            - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default'
+            - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:token-vault/default'
+          - Sid: SecretManager
+            Effect: Allow
+            Action:
+            - secretsmanager:GetSecretValue
+            Resource:
+            - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:bedrock-agentcore-identity!default/oauth2/customersupport*'
+          - Sid: AgentCoreMemory
+            Effect: Allow
+            Action:
+            - bedrock-agentcore:ListMemories
+            - bedrock-agentcore:ListMemoryRecords
+            - bedrock-agentcore:RetrieveMemoryRecords
+            - bedrock-agentcore:GetMemory
+            - bedrock-agentcore:GetMemoryRecord
+            - bedrock-agentcore:CreateEvent
+            - bedrock-agentcore:GetEvent
+            Resource:
+            - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:memory/customersupport*'
+          - Effect: Allow
+            Action:
+            - s3:GetObject
+            - s3:GetObjectVersion
+            Resource: !Sub '${AgentCoreCodeBucket.Arn}/*'
+            Sid: ReadRuntimeCode
+          - Effect: Allow
+            Action:
+            - bedrock-agentcore:GetConfigurationBundle
+            - bedrock-agentcore:GetConfigurationBundleVersion
+            Resource: !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:configuration-bundle/*'
+            Sid: ReadConfigurationBundles
+          - Effect: Allow
+            Action:
+            - bedrock-mantle:CreateInference
+            Resource: '*'
+            Sid: MantleInference
+          - Effect: Allow
+            Action:
+            - bedrock:Retrieve
+            Resource:
+            - !GetAtt 'KnowledgeBase.KnowledgeBaseArn'
+            - !GetAtt 'PlaybookKnowledgeBase.KnowledgeBaseArn'
+            Sid: RetrieveWorkshopKnowledge
+          - Effect: Allow
+            Action:
+            - bedrock:ApplyGuardrail
+            Resource: !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:guardrail/*'
+            Sid: ApplyWorkshopGuardrails
+          - Effect: Allow
+            Action:
+            - bedrock:InvokeGuardrailChecks
+            Resource: '*'
+            Sid: DetectGuardrailChecks
+      RoleName: !Sub 'techmart-runtime-${AWS::Region}'
+      Tags:
+      - Key: Application
+        Value: CustomerSupport
+      - Key: WorkshopStack
+        Value: !Ref 'AWS::StackId'
 
-        
   GatewayAgentCoreRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
-          - Effect: Allow
-            Principal:
-              Service:
-                - bedrock-agentcore.amazonaws.com
-            Action:
-              - sts:AssumeRole
+        - Effect: Allow
+          Principal:
+            Service:
+            - bedrock-agentcore.amazonaws.com
+          Action:
+          - sts:AssumeRole
       Policies:
-        - PolicyName: BedrockAgentPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Sid: InvokeFunction
-                Effect: Allow
-                Action:
-                  - lambda:InvokeFunction
-                Resource:
-                  - !GetAtt CustomerSupportLambda.Arn
-                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:workshop-gateway-*
+      - PolicyName: BedrockAgentPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: InvokeFunction
+            Effect: Allow
+            Action:
+            - lambda:InvokeFunction
+            Resource:
+            - !GetAtt 'CustomerSupportLambda.Arn'
+          - Effect: Allow
+            Action:
+            - bedrock-agentcore:InvokeAgentRuntime
+            Resource:
+            - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/customersupport*'
+            - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/techmart*'
+            Sid: InvokeWorkshopRuntime
+          - Sid: ReadWorkshopBundleVersion
+            Effect: Allow
+            Action: bedrock-agentcore:GetConfigurationBundleVersion
+            Resource: !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:configuration-bundle/WorkshopPrompt*'
+      RoleName: !Sub 'techmart-gateway-${AWS::Region}'
+      Tags:
+      - Key: Application
+        Value: CustomerSupport
+      - Key: WorkshopStack
+        Value: !Ref 'AWS::StackId'
 
-  # DynamoDB Table for Warranty Information
   WarrantyTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -547,9 +1185,6 @@ Resources:
       ServiceToken: !GetAtt PopulateDataFunction.Arn
       WarrantyTableName: !Ref WarrantyTable
       CustomerTableName: !Ref CustomerProfileTable
-    DependsOn:
-      - WarrantyTable
-      - CustomerProfileTable
   
   # Lambda target
   CustomerSupportLambdaRole:
@@ -557,101 +1192,79 @@ Resources:
     Properties:
       Path: /service-role/
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
-          - Action: sts:AssumeRole
-            Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
+        - Action: sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
       Policies:
-        - PolicyName: CustomerProfileAccessPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Sid: AllowReadCustomerTableNameFromSSM
-                Effect: Allow
-                Action: ssm:GetParameter
-                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${CustomerProfileTableNameParameter}
-
-              - Sid: AllowReadCustomerProfileTable
-                Effect: Allow
-                Action:
-                  - dynamodb:GetItem
-                  - dynamodb:Query
-                  - dynamodb:DescribeTable
-                Resource: !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${CustomerProfileTable}
-
-              - Sid: AllowReadCustomerTableIndexes
-                Effect: Allow
-                Action:
-                  - dynamodb:Query
-                Resource: !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${CustomerProfileTable}/index/*
-
-        - PolicyName: WarrantyCheckAccessPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Sid: AllowReadWarrantyTableNameFromSSM
-                Effect: Allow
-                Action: ssm:GetParameter
-                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${WarrantyTableNameParameter}
-
-              - Sid: AllowReadWarrantyTable
-                Effect: Allow
-                Action:
-                  - dynamodb:GetItem
-                  - dynamodb:DescribeTable
-                Resource: !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${WarrantyTable}
-
-        - PolicyName: cloudwatch-logs-access
-          PolicyDocument:
-            Version: 2012-10-17
-            Statement:
-              - Sid: CloudWatchLogReadStatement
-                Effect: Allow
-                Action:
-                  - logs:DescribeLogGroups
-                  - logs:GetQueryResults
-                  - logs:StartQuery
-                Resource: "*"
-              - Sid: CloudWatchLogWriteStatement
-                Effect: Allow
-                Action:
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/evaluations/*"
-              - Sid: CloudWatchIndexPolicyStatement
-                Effect: Allow
-                Action:
-                  - logs:DescribeIndexPolicies
-                  - logs:PutIndexPolicy
-                Resource:
-                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans"
-                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans:*"
-              - Sid: BedrockInvokeStatement
-                Effect: Allow
-                Action:
-                  - bedrock:InvokeModel
-                  - bedrock:InvokeModelWithResponseStream
-                Resource:
-                  - "arn:aws:bedrock:*::foundation-model/*"
-                  - !Sub "arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*"
+      - PolicyName: KnowledgeBaseToolAccess
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: ReadKnowledgeBaseConfiguration
+            Effect: Allow
+            Action: ssm:GetParameter
+            Resource:
+            - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/app/customersupport/kb/type'
+            - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::AccountId}-${AWS::Region}/kb/knowledge-base-id'
+          - Sid: RetrieveWorkshopKnowledgeBase
+            Effect: Allow
+            Action: bedrock:Retrieve
+            Resource: !GetAtt KnowledgeBase.KnowledgeBaseArn
+      - PolicyName: CustomerProfileAccessPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: AllowReadCustomerTableNameFromSSM
+            Effect: Allow
+            Action: ssm:GetParameter
+            Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${CustomerProfileTableNameParameter}'
+          - Sid: AllowReadCustomerProfileTable
+            Effect: Allow
+            Action:
+            - dynamodb:GetItem
+            - dynamodb:Query
+            - dynamodb:DescribeTable
+            Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${CustomerProfileTable}'
+          - Sid: AllowReadCustomerTableIndexes
+            Effect: Allow
+            Action:
+            - dynamodb:Query
+            Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${CustomerProfileTable}/index/*'
+      - PolicyName: WarrantyCheckAccessPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: AllowReadWarrantyTableNameFromSSM
+            Effect: Allow
+            Action: ssm:GetParameter
+            Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${WarrantyTableNameParameter}'
+          - Sid: AllowReadWarrantyTable
+            Effect: Allow
+            Action:
+            - dynamodb:GetItem
+            - dynamodb:DescribeTable
+            Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${WarrantyTable}'
 
   DDGSLayer:
     Type: AWS::Lambda::LayerVersion
+    DependsOn: LambdaCodeSetup
     Properties:
-      LayerName: !Sub "${AWS::StackName}-ddgs-layer"
-      Description: 'DDGS package for Lambda functions'
+      LayerName: !Sub '${AWS::StackName}-ddgs-layer'
+      Description: DDGS package for Lambda functions
       Content:
-        S3Bucket: !Ref  LambdaS3Bucket
-        S3Key: !Ref LayerS3Key
+        S3Bucket: !Ref 'LambdaCodeBucket'
+        S3Key: ddgs-layer.zip
       CompatibleRuntimes:
-        - python3.12
+      - python3.12
       CompatibleArchitectures:
-        - x86_64
+      - x86_64
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
 
   CustomerSupportLambda:
     Type: AWS::Lambda::Function
@@ -659,15 +1272,18 @@ Resources:
       Description: 'Lambda function for Customer Support Assistant'
       Handler: lambda_function.lambda_handler
       Code:
-        S3Bucket: !Ref LambdaS3Bucket
-        S3Key: !Ref LambdaS3Key
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !GetAtt 'LambdaCodeSetup.LambdaS3Key'
       Role: !GetAtt CustomerSupportLambdaRole.Arn
       Runtime: python3.12
+      Timeout: 30
+      MemorySize: 512
       PackageType: Zip
       Architectures:
         - x86_64
       Layers:
         - !Ref DDGSLayer
+        - !Ref Boto3Layer
       Environment:
         Variables:
           PYTHONPATH: /opt/python
@@ -735,105 +1351,366 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      Tags:
+      - Key: Application
+        Value: CustomerSupport
+      - Key: WorkshopStack
+        Value: !Ref 'AWS::StackId'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: AES256
 
-  # Lambda Layer with latest boto3
   Boto3Layer:
-    Type: AWS::CloudFormation::CustomResource
+    Type: AWS::Lambda::LayerVersion
+    DependsOn: Boto3LayerBuild
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
     Properties:
-      ServiceToken: !GetAtt Boto3LayerCreator.Arn
+      Description: Workshop boto3/botocore 1.43.101 (Python 3.12)
+      Content:
+        S3Bucket: !Ref 'LambdaCodeBucket'
+        S3Key: boto3-1.43.101-py312.zip
+      CompatibleRuntimes:
+      - python3.12
+      CompatibleArchitectures:
+      - x86_64
 
   Boto3LayerCreator:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub '${AWS::AccountId}-${AWS::Region}-kb-boto3-layer-creator'
-      Runtime: python3.9
+      Runtime: python3.12
       Handler: index.handler
-      Role: !GetAtt Boto3LayerCreatorRole.Arn
+      Role: !GetAtt 'Boto3LayerCreatorRole.Arn'
       Timeout: 900
-      MemorySize: 1024
+      MemorySize: 512
       Code:
         ZipFile: |
-          import boto3
-          import cfnresponse
-          import zipfile
-          import tempfile
           import os
           import subprocess
           import sys
+          import tempfile
+          import zipfile
+          import boto3
+          import cfnresponse
 
           def handler(event, context):
+              physical_id = event.get('PhysicalResourceId', event['LogicalResourceId'])
               try:
                   if event['RequestType'] == 'Delete':
-                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physical_id)
                       return
-                  
-                  with tempfile.TemporaryDirectory() as temp_dir:
-                      python_dir = os.path.join(temp_dir, 'python')
-                      os.makedirs(python_dir)
-                      
+                  props = event['ResourceProperties']
+                  with tempfile.TemporaryDirectory() as directory:
+                      target = os.path.join(directory, 'python')
                       subprocess.check_call([
-                          sys.executable, '-m', 'pip', 'install', 
-                          'boto3>=1.34.0', 'botocore>=1.34.0',
-                          '--target', python_dir, '--upgrade', '--no-cache-dir'
-                      ])
-                      
-                      zip_path = os.path.join(temp_dir, 'boto3-layer.zip')
-                      with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                          for root, dirs, files in os.walk(python_dir):
-                              for file in files:
-                                  if not file.startswith('.'):
-                                      file_path = os.path.join(root, file)
-                                      arcname = os.path.relpath(file_path, temp_dir)
-                                      zipf.write(file_path, arcname)
-                      
-                      lambda_client = boto3.client('lambda')
-                      with open(zip_path, 'rb') as f:
-                          account_id = context.invoked_function_arn.split(':')[4]
-                          region = context.invoked_function_arn.split(':')[3]
-                          response = lambda_client.publish_layer_version(
-                              LayerName=f"{account_id}-{region}-kb-boto3-layer",
-                              Content={'ZipFile': f.read()},
-                              CompatibleRuntimes=['python3.9', 'python3.10', 'python3.11'],
-                              CompatibleArchitectures=['x86_64']
-                          )
-                      
-                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
-                          'LayerVersionArn': response['LayerVersionArn']
-                      })
-                      
-              except Exception as e:
-                  print(f"Error: {str(e)}")
-                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+                          sys.executable, '-m', 'pip', 'install',
+                          'boto3==' + props['Boto3Version'], 'botocore==' + props['BotocoreVersion'],
+                          '--target', target, '--no-cache-dir',
+                      ], timeout=600)
+                      archive = os.path.join(directory, 'layer.zip')
+                      with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as output:
+                          for root, _, files in os.walk(target):
+                              for name in sorted(files):
+                                  filename = os.path.join(root, name)
+                                  output.write(filename, os.path.relpath(filename, directory))
+                      boto3.client('s3').upload_file(archive, props['BucketName'], props['ObjectKey'])
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physical_id)
+              except Exception as error:
+                  cfnresponse.send(event, context, cfnresponse.FAILED,
+                                   {'Error': str(error)[:1000]}, physical_id)
 
   Boto3LayerCreatorRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub '${AWS::AccountId}-${AWS::Region}-kb-boto3-layer-creator-role'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
       Policies:
-        - PolicyName: LayerCreatorPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - lambda:PublishLayerVersion
-                  - lambda:DeleteLayerVersion
-                Resource: '*'
+      - PolicyName: WorkshopAccess
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:PutObject
+            Resource: !Sub '${LambdaCodeBucket.Arn}/boto3-*.zip'
+      Tags:
+      - Key: Application
+        Value: CustomerSupport
+      - Key: WorkshopStack
+        Value: !Ref 'AWS::StackId'
+      ManagedPolicyArns:
+      - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
 
-  # IAM Role for Bedrock service
   BedrockServiceRole:
     Type: AWS::IAM::Role
     Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: bedrock.amazonaws.com
+          Action: sts:AssumeRole
+          Condition:
+            StringEquals:
+              aws:SourceAccount: !Ref 'AWS::AccountId'
+            ArnLike:
+              aws:SourceArn:
+              - !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*'
+      Policies:
+      - PolicyName: WorkshopAccess
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:ListBucket
+            Resource: !GetAtt 'BedrockKnowledgeBaseDataBucket.Arn'
+            Condition:
+              StringEquals:
+                aws:ResourceAccount: !Ref 'AWS::AccountId'
+          - Effect: Allow
+            Action:
+            - s3:GetObject
+            Resource: !Sub '${BedrockKnowledgeBaseDataBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                aws:ResourceAccount: !Ref 'AWS::AccountId'
+      Tags:
+      - Key: Application
+        Value: CustomerSupport
+      - Key: WorkshopStack
+        Value: !Ref 'AWS::StackId'
       RoleName: !Sub '${AWS::AccountId}-${AWS::Region}-kb-bedrock-service-role'
+
+  KnowledgeBaseSetupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt 'KnowledgeBaseSetupRole.Arn'
+      Timeout: 900
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          import hashlib
+          import time
+          import boto3
+          import cfnresponse
+          from botocore.config import Config
+          from botocore.exceptions import ClientError
+
+          def ingest(event, context):
+              props = event['ResourceProperties']
+              client = boto3.client('bedrock-agent', config=Config(
+                  connect_timeout=5, read_timeout=20, retries={'max_attempts': 3, 'mode': 'standard'}))
+              ids = {'knowledgeBaseId': props['KnowledgeBaseId'], 'dataSourceId': props['DataSourceId']}
+              # Retries of the same CFN request reuse a job. Updates start a new sync.
+              token = hashlib.sha256((event['StackId'] + event['RequestId']).encode()).hexdigest()
+              deadline = time.monotonic() + min(780, context.get_remaining_time_in_millis() / 1000 - 45)
+              while time.monotonic() < deadline:
+                  try:
+                      job = client.start_ingestion_job(**ids, clientToken=token)['ingestionJob']
+                  except ClientError as error:
+                      if error.response['Error']['Code'] != 'ConflictException':
+                          raise
+                      # Wait out an existing sync; do not adopt its success for our changed data.
+                      time.sleep(5)
+                      continue
+                  break
+              else:
+                  raise TimeoutError('Timed out starting knowledge base ingestion')
+              while time.monotonic() < deadline:
+                  job = client.get_ingestion_job(**ids, ingestionJobId=job['ingestionJobId'])['ingestionJob']
+                  status = job['status']
+                  if status == 'COMPLETE':
+                      if job.get('statistics', {}).get('numberOfDocumentsFailed', 0):
+                          raise RuntimeError('Ingestion completed with failed documents: ' + str(job))
+                      return {'Status': 'SUCCESS', 'IngestionStatus': status,
+                              'KnowledgeBaseId': props['KnowledgeBaseId'], 'DataSourceId': props['DataSourceId'],
+                              'FilesUploaded': props['FilesUploaded'], 'Error': 'none'}
+                  if status in ('FAILED', 'STOPPED', 'STOPPING'):
+                      raise RuntimeError('Ingestion ' + status + ': ' + str(job.get('failureReasons', [])))
+                  time.sleep(5)
+              # Cancel only the job started by this request, so rollback can delete
+              # the native data source without leaving an active ingestion behind.
+              client.stop_ingestion_job(**ids, ingestionJobId=job['ingestionJobId'])
+              raise TimeoutError('Knowledge base ingestion did not complete before the callback deadline; stop requested')
+
+          def handler(event, context):
+              physical_id = event.get('PhysicalResourceId', event['LogicalResourceId'])
+              try:
+                  if event['RequestType'] == 'Delete':
+                      # Native DataSource (DELETE), KB and optional vector index own teardown.
+                      data = {'Status': 'DELETED'}
+                  else:
+                      data = ingest(event, context)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, data, physical_id)
+              except Exception as error:
+                  cfnresponse.send(event, context, cfnresponse.FAILED,
+                                   {'Status': 'FAILED', 'Error': str(error)[:1000]}, physical_id)
+      Layers:
+      - !Ref 'Boto3Layer'
+
+  KnowledgeBaseSetupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: WorkshopAccess
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - bedrock:StartIngestionJob
+            - bedrock:GetIngestionJob
+            - bedrock:StopIngestionJob
+            Resource:
+            - !GetAtt 'KnowledgeBase.KnowledgeBaseArn'
+            - !GetAtt 'PlaybookKnowledgeBase.KnowledgeBaseArn'
+      Tags:
+      - Key: Application
+        Value: CustomerSupport
+      - Key: WorkshopStack
+        Value: !Ref 'AWS::StackId'
+      ManagedPolicyArns:
+      - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+
+  KnowledgeBaseSetup:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt 'KnowledgeBaseSetupFunction.Arn'
+      KnowledgeBaseId: !GetAtt 'KnowledgeBase.KnowledgeBaseId'
+      DataSourceId: !GetAtt 'KnowledgeBaseDataSource.DataSourceId'
+      FilesUploaded: !GetAtt 'KnowledgeBaseDocuments.FilesUploaded'
+      DatasetVersion: '2026-09-24'
+
+  PlaybookKbDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::AccountId}-${AWS::Region}-playbook-kb-data-bucket'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+      - Key: Application
+        Value: CustomerSupport
+      - Key: WorkshopStack
+        Value: !Ref 'AWS::StackId'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: AES256
+
+  PlaybookKbBedrockServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: bedrock.amazonaws.com
+          Action: sts:AssumeRole
+          Condition:
+            StringEquals:
+              aws:SourceAccount: !Ref 'AWS::AccountId'
+            ArnLike:
+              aws:SourceArn:
+              - !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*'
+      Policies:
+      - PolicyName: WorkshopAccess
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:GetObject
+            - s3:ListBucket
+            Resource:
+            - !GetAtt 'PlaybookKbDataBucket.Arn'
+            - !Sub '${PlaybookKbDataBucket.Arn}/*'
+          - Effect: Allow
+            Action:
+            - bedrock:InvokeModel
+            Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0'
+          - Effect: Allow
+            Action:
+            - bedrock:Rerank
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - bedrock:InvokeModel
+            Resource:
+            - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/cohere.rerank-v3-5:0'
+            - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.rerank-v1:0'
+          - Effect: Allow
+            Action:
+            - s3vectors:GetIndex
+            - s3vectors:QueryVectors
+            - s3vectors:GetVectors
+            - s3vectors:PutVectors
+            - s3vectors:DeleteVectors
+            Resource: !GetAtt 'PlaybookKnowledgeBaseVectorIndex.IndexArn'
+      Tags:
+      - Key: Application
+        Value: CustomerSupport
+      - Key: WorkshopStack
+        Value: !Ref 'AWS::StackId'
+      RoleName: !Sub '${AWS::AccountId}-${AWS::Region}-playbook-kb-bedrock-role'
+
+  PlaybookKbSetup:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt 'KnowledgeBaseSetupFunction.Arn'
+      KnowledgeBaseId: !GetAtt 'PlaybookKnowledgeBase.KnowledgeBaseId'
+      DataSourceId: !GetAtt 'PlaybookKnowledgeBaseDataSource.DataSourceId'
+      FilesUploaded: !GetAtt 'PlaybookKbDocuments.FilesUploaded'
+      DatasetVersion: '2026-09-24'
+
+  PlaybookBatchBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::AccountId}-${AWS::Region}-playbook-batch'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+        - Id: expire-batch-artifacts
+          Status: Enabled
+          ExpirationInDays: 7
+      Tags:
+      - Key: Application
+        Value: CustomerSupport
+      - Key: WorkshopStack
+        Value: !Ref 'AWS::StackId'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: AES256
+
+  PlaybookBatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::AccountId}-${AWS::Region}-playbook-batch-role'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -841,582 +1718,1052 @@ Resources:
             Principal:
               Service: bedrock.amazonaws.com
             Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
       Policies:
-        - PolicyName: BedrockS3AccessPolicy
+        - PolicyName: PlaybookBatchS3Access
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
                 Action:
                   - s3:GetObject
+                  - s3:PutObject
                   - s3:ListBucket
                 Resource:
-                  - !GetAtt BedrockKnowledgeBaseDataBucket.Arn
-                  - !Sub '${BedrockKnowledgeBaseDataBucket.Arn}/*'
-              - Effect: Allow
-                Action:
-                  - bedrock:InvokeModel
-                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0'
-              - Effect: Allow
-                Action:
-                  - s3vectors:ListIndexes
-                  - s3vectors:ListVectorBuckets
-                  - s3vectors:ListVectors
-                  - s3vectors:ListIndexes
-                  - s3vectors:GetVectorBucket
-                  - s3vectors:GetVectors
-                  - s3vectors:GetIndex
-                  - s3vectors:PutVectorBucketPolicy
-                  - s3vectors:PutVectors
-                  - s3vectors:CreateVectorBucket
-                  - s3vectors:CreateIndex
-                  - s3vectors:QueryVectors
-                  - s3vectors:GetVectorBucketPolicy
-                Resource: '*'
+                  - !GetAtt PlaybookBatchBucket.Arn
+                  - !Sub '${PlaybookBatchBucket.Arn}/*'
 
-  # Lambda function with technical documentation content
-  KnowledgeBaseSetupFunction:
+  # Publish the batch bucket + role so the notebook can read them from SSM and run the job
+  # without the participant setting env vars by hand.
+  PlaybookBatchBucketParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /app/customersupport/batch/bucket_name
+      Type: String
+      Value: !Ref PlaybookBatchBucket
+
+  PlaybookBatchRoleParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /app/customersupport/batch/role_arn
+      Type: String
+      Value: !GetAtt PlaybookBatchRole.Arn
+  AgentCoreCodeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'techmart-agentcore-code-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+      - Key: Workshop
+        Value: bedrock-prompt-optimization
+      - Key: Application
+        Value: CustomerSupport
+      - Key: WorkshopStack
+        Value: !Ref 'AWS::StackId'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: AES256
+
+  AgentCoreCodeBucketParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /app/customersupport/agentcore/artifact_bucket
+      Type: String
+      Value: !Ref 'AgentCoreCodeBucket'
+      Tags:
+        Application: CustomerSupport
+
+  AgentCoreEvaluationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: bedrock-agentcore.amazonaws.com
+          Action: sts:AssumeRole
+          Condition:
+            StringEquals:
+              aws:SourceAccount: !Ref 'AWS::AccountId'
+            ArnLike:
+              aws:SourceArn:
+              - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:evaluator/*'
+              - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:online-evaluation-config/*'
+      Policies:
+      - PolicyName: WorkshopAccess
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:DescribeLogGroups
+            - logs:GetQueryResults
+            - logs:StopQuery
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - logs:StartQuery
+            - logs:GetLogEvents
+            - logs:FilterLogEvents
+            Resource:
+            - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*'
+            - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/workshop/*'
+            - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans'
+            - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans:*'
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource:
+            - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/evaluations/*'
+            - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/techmart*'
+            - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/workshop/*'
+          - Effect: Allow
+            Action:
+            - logs:DescribeIndexPolicies
+            - logs:PutIndexPolicy
+            Resource:
+            - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*'
+            - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/workshop/*'
+            - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans'
+            - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans:*'
+          - Effect: Allow
+            Action:
+            - bedrock:InvokeModel
+            - bedrock:InvokeModelWithResponseStream
+            Resource:
+            - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/*'
+            - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*'
+            - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:application-inference-profile/*'
+          - Effect: Allow
+            Action:
+            - lambda:InvokeFunction
+            Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:techmart-eval-*'
+      Tags:
+      - Key: Application
+        Value: CustomerSupport
+      - Key: WorkshopStack
+        Value: !Ref 'AWS::StackId'
+      RoleName: !Sub 'techmart-evaluation-${AWS::Region}'
+
+  AgentCoreABTestRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: bedrock-agentcore.amazonaws.com
+          Action: sts:AssumeRole
+          Condition:
+            StringEquals:
+              aws:SourceAccount: !Ref 'AWS::AccountId'
+            ArnLike:
+              aws:SourceArn:
+              - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:ab-test/*'
+      Policies:
+      - PolicyName: WorkshopAccess
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - bedrock-agentcore:GetGateway
+            - bedrock-agentcore:GetGatewayTarget
+            - bedrock-agentcore:ListGatewayTargets
+            - bedrock-agentcore:CreateGatewayRule
+            - bedrock-agentcore:GetGatewayRule
+            - bedrock-agentcore:UpdateGatewayRule
+            - bedrock-agentcore:DeleteGatewayRule
+            - bedrock-agentcore:ListGatewayRules
+            Resource:
+            - !GetAtt 'ABTestGateway.GatewayArn'
+            - !Sub '${ABTestGateway.GatewayArn}/*'
+          - Effect: Allow
+            Action:
+            - bedrock-agentcore:GetConfigurationBundle
+            - bedrock-agentcore:GetConfigurationBundleVersion
+            Resource: !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:configuration-bundle/*'
+          - Effect: Allow
+            Action:
+            - bedrock-agentcore:GetOnlineEvaluationConfig
+            Resource: !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:online-evaluation-config/*'
+          - Effect: Allow
+            Action:
+            - logs:StartQuery
+            - logs:GetLogEvents
+            - logs:FilterLogEvents
+            Resource:
+            - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*'
+            - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/workshop/*'
+            - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans'
+            - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans:*'
+            - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/evaluations/*'
+          - Effect: Allow
+            Action:
+            - logs:DescribeLogGroups
+            - logs:GetQueryResults
+            - logs:StopQuery
+            Resource: '*'
+      Tags:
+      - Key: Application
+        Value: CustomerSupport
+      - Key: WorkshopStack
+        Value: !Ref 'AWS::StackId'
+      RoleName: !Sub 'techmart-abtest-${AWS::Region}'
+
+  ABTestGateway:
+    Type: AWS::BedrockAgentCore::Gateway
+    Properties:
+      Name: techmart-ab-gateway
+      Description: Workshop HTTP passthrough A/B gateway; notebook attaches the deployed Runtime
+      AuthorizerType: AWS_IAM
+      # HTTP Runtime targets require protocolType to be omitted, not "MCP".
+      RoleArn: !GetAtt 'GatewayAgentCoreRole.Arn'
+      Tags:
+        Application: CustomerSupport
+        WorkshopStack: !Ref 'AWS::StackId'
+
+  AgentCoreEvaluationRoleArnParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /app/customersupport/agentcore/evaluation_role_arn
+      Type: String
+      Value: !GetAtt 'AgentCoreEvaluationRole.Arn'
+      Tags:
+        Application: CustomerSupport
+
+  AgentCoreAbtestRoleArnParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /app/customersupport/agentcore/abtest_role_arn
+      Type: String
+      Value: !GetAtt 'AgentCoreABTestRole.Arn'
+      Tags:
+        Application: CustomerSupport
+
+  AgentCoreAbGatewayArnParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /app/customersupport/agentcore/ab_gateway_arn
+      Type: String
+      Value: !GetAtt 'ABTestGateway.GatewayArn'
+      Tags:
+        Application: CustomerSupport
+
+  AgentCoreAbGatewayIdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /app/customersupport/agentcore/ab_gateway_id
+      Type: String
+      Value: !GetAtt 'ABTestGateway.GatewayIdentifier'
+      Tags:
+        Application: CustomerSupport
+
+  AgentCoreAbGatewayUrlParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /app/customersupport/agentcore/ab_gateway_url
+      Type: String
+      Value: !GetAtt 'ABTestGateway.GatewayUrl'
+      Tags:
+        Application: CustomerSupport
+
+  NotebookAgentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/bedrock-agentcore/workshop/notebook-agents
+      RetentionInDays: 7
+      Tags:
+      - Key: Application
+        Value: CustomerSupport
+      - Key: WorkshopStack
+        Value: !Ref 'AWS::StackId'
+
+  NotebookAgentLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref 'NotebookAgentLogGroup'
+      LogStreamName: default
+
+  NotebookAgentLogGroupParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /app/customersupport/observability/notebook_log_group
+      Type: String
+      Value: !Ref 'NotebookAgentLogGroup'
+      Tags:
+        Application: CustomerSupport
+
+  Boto3LayerBuild:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt 'Boto3LayerCreator.Arn'
+      BucketName: !Ref 'LambdaCodeBucket'
+      ObjectKey: boto3-1.43.101-py312.zip
+      Boto3Version: 1.43.101
+      BotocoreVersion: 1.43.101
+    DependsOn: WorkshopBucketCleanup
+
+  KnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    DependsOn: WorkshopBucketCleanup
+    Properties:
+      Name: !Sub '${AWS::AccountId}-${AWS::Region}-kb-managed'
+      RoleArn: !GetAtt 'BedrockServiceRole.Arn'
+      KnowledgeBaseConfiguration:
+        Type: MANAGED
+        ManagedKnowledgeBaseConfiguration:
+          EmbeddingModelType: MANAGED
+      Tags:
+        Application: CustomerSupport
+        WorkshopStack: !Ref 'AWS::StackId'
+
+  KnowledgeBaseDataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      KnowledgeBaseId: !GetAtt 'KnowledgeBase.KnowledgeBaseId'
+      Name: !Sub '${AWS::AccountId}-${AWS::Region}-kb-managed-datasource'
+      DataDeletionPolicy: DELETE
+      DataSourceConfiguration:
+        Type: MANAGED_KNOWLEDGE_BASE_CONNECTOR
+        ManagedKnowledgeBaseConnectorConfiguration:
+          DeletionProtectionConfiguration:
+            DeletionProtectionStatus: DISABLED
+          # This is opaque connector JSON, not CFN PascalCase properties.
+          ConnectorParameters:
+            type: S3
+            version: '1'
+            connectionConfiguration:
+              bucketName: !Ref 'BedrockKnowledgeBaseDataBucket'
+              bucketOwnerAccountId: !Ref 'AWS::AccountId'
+  KbKnowledgeBaseIdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${AWS::AccountId}-${AWS::Region}/kb/knowledge-base-id'
+      Type: String
+      Value: !GetAtt 'KnowledgeBase.KnowledgeBaseId'
+      Tags:
+        Application: CustomerSupport
+    DependsOn: KnowledgeBaseSetup
+
+  KbTypeParameter:
+    Type: AWS::SSM::Parameter
+    DependsOn: KnowledgeBaseSetup
+    Properties:
+      Name: /app/customersupport/kb/type
+      Type: String
+      Value: managed
+      Description: Retrieval adapter contract; use managedSearchConfiguration for this KB
+      Tags:
+        Application: CustomerSupport
+
+  KbDataSourceIdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${AWS::AccountId}-${AWS::Region}/kb/data-source-id'
+      Type: String
+      Value: !GetAtt 'KnowledgeBaseDataSource.DataSourceId'
+      Tags:
+        Application: CustomerSupport
+    DependsOn: KnowledgeBaseSetup
+
+  PlaybookKnowledgeBaseVectorBucket:
+    Type: AWS::S3Vectors::VectorBucket
+    Properties:
+      VectorBucketName: !Sub '${AWS::AccountId}-${AWS::Region}-playbook-kb-native-vectors'
+      EncryptionConfiguration:
+        SseType: AES256
+      Tags:
+      - Key: Application
+        Value: CustomerSupport
+      - Key: WorkshopStack
+        Value: !Ref 'AWS::StackId'
+
+  PlaybookKnowledgeBaseVectorIndex:
+    Type: AWS::S3Vectors::Index
+    Properties:
+      VectorBucketArn: !GetAtt 'PlaybookKnowledgeBaseVectorBucket.VectorBucketArn'
+      IndexName: documents
+      DataType: float32
+      Dimension: 1024
+      DistanceMetric: cosine
+      MetadataConfiguration:
+        NonFilterableMetadataKeys:
+        - AMAZON_BEDROCK_TEXT
+        - AMAZON_BEDROCK_METADATA
+      Tags:
+      - Key: Application
+        Value: CustomerSupport
+      - Key: WorkshopStack
+        Value: !Ref 'AWS::StackId'
+
+  PlaybookKnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    DependsOn: WorkshopBucketCleanup
+    Properties:
+      Name: !Sub '${AWS::AccountId}-${AWS::Region}-playbook-kb'
+      RoleArn: !GetAtt 'PlaybookKbBedrockServiceRole.Arn'
+      KnowledgeBaseConfiguration:
+        Type: VECTOR
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0'
+          EmbeddingModelConfiguration:
+            BedrockEmbeddingModelConfiguration:
+              Dimensions: 1024
+              EmbeddingDataType: FLOAT32
+      StorageConfiguration:
+        Type: S3_VECTORS
+        S3VectorsConfiguration:
+          IndexArn: !GetAtt 'PlaybookKnowledgeBaseVectorIndex.IndexArn'
+      Tags:
+        Application: CustomerSupport
+        WorkshopStack: !Ref 'AWS::StackId'
+
+  PlaybookKnowledgeBaseDataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      KnowledgeBaseId: !GetAtt 'PlaybookKnowledgeBase.KnowledgeBaseId'
+      Name: !Sub '${AWS::AccountId}-${AWS::Region}-playbook-kb-datasource'
+      DataDeletionPolicy: DELETE
+      DataSourceConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketArn: !GetAtt 'PlaybookKbDataBucket.Arn'
+      VectorIngestionConfiguration:
+        ChunkingConfiguration:
+          ChunkingStrategy: HIERARCHICAL
+          HierarchicalChunkingConfiguration:
+            LevelConfigurations:
+            - MaxTokens: 1500
+            - MaxTokens: 300
+            OverlapTokens: 60
+
+  PlaybookKbKnowledgeBaseIdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${AWS::AccountId}-${AWS::Region}/playbook-kb/knowledge-base-id'
+      Type: String
+      Value: !GetAtt 'PlaybookKnowledgeBase.KnowledgeBaseId'
+      Tags:
+        Application: CustomerSupport
+    DependsOn: PlaybookKbSetup
+
+  PlaybookKbDataSourceIdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${AWS::AccountId}-${AWS::Region}/playbook-kb/data-source-id'
+      Type: String
+      Value: !GetAtt 'PlaybookKnowledgeBaseDataSource.DataSourceId'
+      Tags:
+        Application: CustomerSupport
+    DependsOn: PlaybookKbSetup
+
+  KnowledgeBaseDocumentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: WorkshopAccess
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:PutObject
+            Resource:
+            - !Sub '${BedrockKnowledgeBaseDataBucket.Arn}/*'
+            - !Sub '${PlaybookKbDataBucket.Arn}/*'
+      Tags:
+      - Key: Application
+        Value: CustomerSupport
+      - Key: WorkshopStack
+        Value: !Ref 'AWS::StackId'
+      ManagedPolicyArns:
+      - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+
+  KnowledgeBaseDocumentFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub '${AWS::AccountId}-${AWS::Region}-kb-setup-function'
-      Runtime: python3.9
-      Handler: index.lambda_handler
-      Role: !GetAtt KnowledgeBaseSetupRole.Arn
-      Timeout: 600
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt 'KnowledgeBaseDocumentRole.Arn'
+      Timeout: 120
       MemorySize: 512
-      Layers:
-        - !GetAtt Boto3Layer.LayerVersionArn
+      Code:
+        ZipFile: "import boto3\nimport cfnresponse\nimport json\n\nDATASETS = {'developer': {'troubleshooting-guide.txt':\
+          \ ('Common Electronics Troubleshooting Guide\\n'\n                                             '\\n'\n \
+          \                                            'POWER ISSUES\\n'\n                                       \
+          \      \"1. Device won't turn on\\n\"\n                                             '   - Check power cable\
+          \ connections\\n'\n                                             '   - Verify power outlet functionality\
+          \  \\n'\n                                             '   - Try different power cable if available\\n'\n\
+          \                                             '   - Check for physical damage to device\\n'\n          \
+          \                                   '\\n'\n                                             '2. Device turns\
+          \ off unexpectedly\\n'\n                                             '   - Check for overheating\\n'\n \
+          \                                            '   - Verify power supply capacity\\n'\n                  \
+          \                           '   - Update device firmware\\n'\n                                         \
+          \    '   - Check for loose connections\\n'\n                                             '\\n'\n       \
+          \                                      'CONNECTIVITY ISSUES  \\n'\n                                    \
+          \         '1. Wi-Fi connection problems\\n'\n                                             '   - Restart\
+          \ router and device\\n'\n                                             '   - Check Wi-Fi password accuracy\\\
+          n'\n                                             '   - Update network drivers\\n'\n                    \
+          \                         '   - Reset network settings\\n'\n                                           \
+          \  '\\n'\n                                             '2. Bluetooth pairing issues\\n'\n              \
+          \                               '   - Clear Bluetooth cache\\n'\n                                      \
+          \       '   - Remove and re-pair devices\\n'\n                                             '   - Check compatibility\\\
+          n'\n                                             '   - Update Bluetooth drivers\\n'\n                  \
+          \                           '\\n'\n                                             'PERFORMANCE ISSUES\\n'\n\
+          \                                             '1. Slow performance\\n'\n                               \
+          \              '   - Close unnecessary applications\\n'\n                                             '\
+          \   - Check available storage space\\n'\n                                             '   - Run system updates\\\
+          n'\n                                             '   - Clear cache and temporary files\\n'\n           \
+          \                                  '\\n'\n                                             '2. Audio and Video\
+          \ problems\\n'\n                                             '   - Check cable connections\\n'\n       \
+          \                                      '   - Update audio and video drivers\\n'\n                      \
+          \                       '   - Verify settings configuration\\n'\n                                      \
+          \       '   - Test with different media',\n                                             None),\n       \
+          \        'laptop-maintenance-guide.txt': ('Laptop Maintenance and Care Guide\\n'\n                     \
+          \                           '\\n'\n                                                'DAILY CARE\\n'\n   \
+          \                                             '- Keep laptop on hard flat surfaces for '\n             \
+          \                                   'proper ventilation\\n'\n                                          \
+          \      '- Avoid eating or drinking near the laptop\\n'\n                                               \
+          \ '- Clean screen gently with microfiber cloth\\n'\n                                                '- Close\
+          \ laptop carefully without slamming\\n'\n                                                '\\n'\n       \
+          \                                         'WEEKLY MAINTENANCE\\n'\n                                    \
+          \            '- Clean keyboard with compressed air\\n'\n                                               \
+          \ '- Wipe down exterior with damp cloth\\n'\n                                                '- Check for\
+          \ software updates\\n'\n                                                '- Empty downloads and temp folders\\\
+          n'\n                                                '\\n'\n                                            \
+          \    'MONTHLY TASKS\\n'\n                                                '- Deep clean vents and fans\\\
+          n'\n                                                '- Check battery health and calibrate\\n'\n        \
+          \                                        '- Update all drivers and software\\n'\n                      \
+          \                          '- Run disk cleanup and defragmentation\\n'\n                               \
+          \                 '- Backup important data\\n'\n                                                '\\n'\n\
+          \                                                'PERFORMANCE OPTIMIZATION\\n'\n                       \
+          \                         '- Uninstall unused programs\\n'\n                                           \
+          \     '- Manage startup programs\\n'\n                                                '- Check hard drive\
+          \ health\\n'\n                                                '- Monitor temperature levels\\n'\n      \
+          \                                          '- Keep 15-20% disk space free\\n'\n                        \
+          \                        '\\n'\n                                                'WARNING SIGNS\\n'\n   \
+          \                                             '- Excessive heat generation\\n'\n                       \
+          \                         '- Unusual fan noise\\n'\n                                                '- Slow\
+          \ boot times\\n'\n                                                '- Frequent crashes or freezes\\n'\n \
+          \                                               '- Reduced battery life',\n                            \
+          \                    None),\n               'smartphone-setup-guide.txt': ('Smartphone Initial Setup and\
+          \ Configuration '\n                                              'Guide\\n'\n                          \
+          \                    '\\n'\n                                              'FIRST-TIME SETUP\\n'\n      \
+          \                                        '1. Charge device to at least 50% before first '\n            \
+          \                                  'use\\n'\n                                              '2. Insert SIM\
+          \ card if applicable\\n'\n                                              '3. Power on and follow setup wizard\\\
+          n'\n                                              '4. Connect to Wi-Fi network\\n'\n                   \
+          \                           '5. Sign in to your account Apple ID or Google '\n                         \
+          \                     'Account\\n'\n                                              '6. Configure security\
+          \ PIN fingerprint face '\n                                              'unlock\\n'\n                  \
+          \                            '7. Restore from backup or set up as new '\n                              \
+          \                'device\\n'\n                                              '\\n'\n                    \
+          \                          'SECURITY CONFIGURATION\\n'\n                                              '-\
+          \ Enable automatic screen lock\\n'\n                                              '- Set up biometric authentication\\\
+          n'\n                                              '- Configure Find My Device or Find My iPhone\\n'\n  \
+          \                                            '- Enable automatic app updates\\n'\n                     \
+          \                         '- Set up two-factor authentication\\n'\n                                    \
+          \          '\\n'\n                                              'ESSENTIAL APPS\\n'\n                  \
+          \                            '- Email client configuration\\n'\n                                       \
+          \       '- Banking and payment apps\\n'\n                                              '- Navigation and\
+          \ maps\\n'\n                                              '- Communication apps\\n'\n                  \
+          \                            '- Backup and cloud storage\\n'\n                                         \
+          \     '\\n'\n                                              'BATTERY OPTIMIZATION\\n'\n                 \
+          \                             '- Enable battery optimization settings\\n'\n                            \
+          \                  '- Adjust screen brightness and timeout\\n'\n                                       \
+          \       '- Manage background app refresh\\n'\n                                              '- Configure\
+          \ location services\\n'\n                                              '- Set up low power mode\\n'\n  \
+          \                                            '\\n'\n                                              'DATA\
+          \ MANAGEMENT\\n'\n                                              '- Configure cloud backup schedules\\n'\n\
+          \                                              '- Set up automatic photo backup\\n'\n                  \
+          \                            '- Manage storage and cleanup\\n'\n                                       \
+          \       '- Configure data usage limits\\n'\n                                              '- Set up family\
+          \ sharing if applicable',\n                                              None),\n               'monitor-calibration-guide.txt':\
+          \ ('Monitor Setup and Calibration Guide\\n'\n                                                 '\\n'\n  \
+          \                                               'PHYSICAL SETUP\\n'\n                                  \
+          \               '- Position monitor at arms length 20-26 '\n                                           \
+          \      'inches\\n'\n                                                 '- Top of screen at or below eye level\\\
+          n'\n                                                 '- Minimize glare from windows and lights\\n'\n   \
+          \                                              '- Ensure stable desk placement\\n'\n                   \
+          \                              '\\n'\n                                                 'DISPLAY SETTINGS\\\
+          n'\n                                                 '1. Resolution - Set to native resolution\\n'\n   \
+          \                                              '2. Brightness - 120-150 cd per m\xB2 for '\n           \
+          \                                      'office use\\n'\n                                               \
+          \  '3. Contrast - 1000 to 1 ratio recommended\\n'\n                                                 '4.\
+          \ Color temperature - 6500K for general '\n                                                 'use\\n'\n \
+          \                                                '5. Gamma - 2.2 for Windows 1.8 for Mac\\n'\n         \
+          \                                        '\\n'\n                                                 'COLOR\
+          \ CALIBRATION\\n'\n                                                 '- Use built-in calibration tools\\\
+          n'\n                                                 '- Consider hardware colorimeter for '\n          \
+          \                                       'precision\\n'\n                                               \
+          \  '- Calibrate monthly for professional work\\n'\n                                                 '- Save\
+          \ custom color profiles\\n'\n                                                 '\\n'\n                  \
+          \                               'ERGONOMIC CONSIDERATIONS\\n'\n                                        \
+          \         '- Monitor height adjustment\\n'\n                                                 '- Tilt angle\
+          \ 10-20 degrees back\\n'\n                                                 '- Multiple monitor alignment\\\
+          n'\n                                                 '- Proper lighting setup\\n'\n                    \
+          \                             '\\n'\n                                                 'TROUBLESHOOTING\\\
+          n'\n                                                 '- Flickering - Check cable connections and '\n   \
+          \                                              'refresh rate\\n'\n                                     \
+          \            '- Color issues - Update graphics drivers\\n'\n                                           \
+          \      '- Blurry text - Verify native resolution\\n'\n                                                 '-\
+          \ Dead pixels - Check warranty coverage',\n                                                 None),\n   \
+          \            'wireless-connectivity-guide.txt': ('Wireless Connectivity Setup and '\n                  \
+          \                                 'Troubleshooting\\n'\n                                               \
+          \    '\\n'\n                                                   'WI-FI SETUP\\n'\n                      \
+          \                             '1. Locate network settings in device\\n'\n                              \
+          \                     '2. Select your network from available '\n                                       \
+          \            'list\\n'\n                                                   '3. Enter network password carefully\\\
+          n'\n                                                   '4. Configure network security settings\\n'\n   \
+          \                                                '5. Test internet connectivity\\n'\n                  \
+          \                                 '\\n'\n                                                   'BLUETOOTH PAIRING\\\
+          n'\n                                                   '1. Enable Bluetooth on both devices\\n'\n      \
+          \                                             '2. Put accessory in pairing mode\\n'\n                  \
+          \                                 '3. Select device from available list\\n'\n                          \
+          \                         '4. Complete pairing process\\n'\n                                           \
+          \        '5. Test functionality\\n'\n                                                   '\\n'\n        \
+          \                                           'COMMON WI-FI ISSUES\\n'\n                                 \
+          \                  '- Weak signal - Move closer to router '\n                                          \
+          \         'check for interference\\n'\n                                                   '- Slow speeds\
+          \ - Check bandwidth usage '\n                                                   'update router firmware\\\
+          n'\n                                                   '- Connection drops - Update network '\n        \
+          \                                           'drivers check power saving\\n'\n                          \
+          \                         '- Cannot connect - Verify password '\n                                      \
+          \             'restart network adapter\\n'\n                                                   '\\n'\n \
+          \                                                  'BLUETOOTH TROUBLESHOOTING\\n'\n                    \
+          \                               '- Pairing fails - Clear Bluetooth cache '\n                           \
+          \                        'restart both devices\\n'\n                                                   '-\
+          \ Audio stuttering - Check for '\n                                                   'interference update\
+          \ drivers\\n'\n                                                   '- Connection unstable - Verify '\n  \
+          \                                                 'compatibility check battery levels\\n'\n            \
+          \                                       '- Device not found - Ensure proper '\n                        \
+          \                           'pairing mode activation\\n'\n                                             \
+          \      '\\n'\n                                                   'SECURITY CONSIDERATIONS\\n'\n        \
+          \                                           '- Use WPA3 encryption when available\\n'\n                \
+          \                                   '- Regularly update device firmware\\n'\n                          \
+          \                         '- Avoid public Wi-Fi for sensitive '\n                                      \
+          \             'activities\\n'\n                                                   '- Monitor connected devices\
+          \ regularly',\n                                                   None),\n               'warranty-service-guide.txt':\
+          \ ('Warranty and Service Information Guide\\n'\n                                              '\\n'\n  \
+          \                                            'WARRANTY COVERAGE\\n'\n                                  \
+          \            '- Manufacturing defects - Full coverage\\n'\n                                            \
+          \  '- Normal wear and tear - Not covered\\n'\n                                              '- Accidental\
+          \ damage - Extended warranty plans '\n                                              'available\\n'\n   \
+          \                                           '- Water damage - Generally not covered check '\n          \
+          \                                    'IP rating\\n'\n                                              '- Software\
+          \ issues - Covered if not '\n                                              'user-caused\\n'\n          \
+          \                                    '\\n'\n                                              'WARRANTY CLAIMS\
+          \ PROCESS\\n'\n                                              '1. Gather proof of purchase and serial number\\\
+          n'\n                                              '2. Contact technical support for diagnosis\\n'\n    \
+          \                                          '3. Complete warranty claim form\\n'\n                      \
+          \                        '4. Package device securely for shipping\\n'\n                                \
+          \              '5. Track repair status through online portal\\n'\n                                     \
+          \         '\\n'\n                                              'SERVICE OPTIONS\\n'\n                  \
+          \                            '- In-warranty repairs - Free parts and labor\\n'\n                       \
+          \                       '- Out-of-warranty repairs - Quote provided '\n                                \
+          \              'before service\\n'\n                                              '- Express service - Available\
+          \ for additional '\n                                              'fee\\n'\n                           \
+          \                   '- On-site service - Available for business '\n                                    \
+          \          'customers\\n'\n                                              '\\n'\n                       \
+          \                       'EXTENDED WARRANTY PLANS\\n'\n                                              '- Accidental\
+          \ damage protection\\n'\n                                              '- Extended coverage periods\\n'\n\
+          \                                              '- Premium technical support\\n'\n                      \
+          \                        '- Replacement device programs\\n'\n                                          \
+          \    '\\n'\n                                              'SUPPORT CHANNELS\\n'\n                      \
+          \                        '- Online chat - 24/7 availability\\n'\n                                      \
+          \        '- Phone support - Business hours\\n'\n                                              '- Email support\
+          \ - 24-hour response\\n'\n                                              '- Video troubleshooting - Appointment\
+          \ based',\n                                              None)},\n 'playbook': {'laptop-pro15-specs.txt':\
+          \ ('The TechMart Pro 15 laptop ships with an Intel Core '\n                                         'i7,\
+          \ 16GB RAM (upgradeable to 32GB), a 512GB NVMe '\n                                         'SSD, and a 15.6-inch\
+          \ 144Hz display. Battery life is '\n                                         'up to 10 hours. It carries\
+          \ a 1-year manufacturer '\n                                         'warranty; refurbished units carry 90\
+          \ days.',\n                                         {'product_line': 'laptops', 'doc_type': 'specs'}),\n\
+          \              'phone-x-specs.txt': ('The TechMart Phone X has a 6.7-inch AMOLED 120Hz '\n             \
+          \                       'display, Snapdragon 8 Gen 2, 8GB RAM, 256GB storage, and '\n                  \
+          \                  'a 5000mAh battery with 65W fast charging. Warranty is 1 '\n                        \
+          \            'year; refurbished phones are warrantied for 90 days.',\n                                 \
+          \   {'product_line': 'phones', 'doc_type': 'specs'}),\n              'returns-faq.txt': ('Returns: undamaged\
+          \ items may be returned within 30 days '\n                                  'with original packaging. Refurbished\
+          \ items have a 30-day '\n                                  'return window as well. Refunds are issued 5-7\
+          \ business '\n                                  'days after inspection. Opened headphones are returnable\
+          \ '\n                                  'only if defective.',\n                                  {'product_line':\
+          \ 'all', 'doc_type': 'policy'}),\n              'warranty-faq.txt': ('Warranty: all new electronics include\
+          \ a 1-year '\n                                   'manufacturer warranty. Refurbished products include a\
+          \ '\n                                   '90-day warranty. Accidental damage is not covered unless '\n  \
+          \                                 'an extended protection plan was purchased. Warranty is '\n          \
+          \                         'not transferable between owners.',\n                                   {'product_line':\
+          \ 'all', 'doc_type': 'policy'}),\n              'audio-soundpro-specs.txt': ('The TechMart SoundPro headphones\
+          \ are over-ear '\n                                           'wireless with active noise cancellation, 30-hour\
+          \ '\n                                           'battery (ANC on), Bluetooth 5.2, and a 3.5mm '\n      \
+          \                                     'jack. Warranty is 1 year; refurbished units 90 '\n              \
+          \                             'days.',\n                                           {'product_line': 'audio',\
+          \ 'doc_type': 'specs'})}}\n\n\ndef handler(event, context):\n    physical_id = event.get('PhysicalResourceId',\
+          \ event['LogicalResourceId'])\n    try:\n        if event['RequestType'] == 'Delete':\n            # Stack-owned\
+          \ buckets are emptied after all consumers have been deleted.\n            cfnresponse.send(event, context,\
+          \ cfnresponse.SUCCESS, {}, physical_id)\n            return\n        props = event['ResourceProperties']\n\
+          \        documents = DATASETS[props['Dataset']]\n        s3 = boto3.client('s3')\n        for name, (content,\
+          \ metadata) in documents.items():\n            s3.put_object(Bucket=props['BucketName'], Key=name,\n   \
+          \                       Body=content.strip().encode('utf-8'), ContentType='text/plain')\n            if\
+          \ metadata is not None:\n                s3.put_object(Bucket=props['BucketName'], Key=name + '.metadata.json',\n\
+          \                              Body=json.dumps({'metadataAttributes': metadata}).encode('utf-8'),\n    \
+          \                          ContentType='application/json')\n        cfnresponse.send(event, context, cfnresponse.SUCCESS,\n\
+          \                         {'FilesUploaded': len(documents)}, physical_id)\n    except Exception as error:\n\
+          \        cfnresponse.send(event, context, cfnresponse.FAILED,\n                         {'Error': str(error)[:1000]},\
+          \ physical_id)\n"
+
+  KnowledgeBaseDocuments:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt 'KnowledgeBaseDocumentFunction.Arn'
+      BucketName: !Ref 'BedrockKnowledgeBaseDataBucket'
+      Dataset: developer
+      DatasetVersion: '2026-09-24'
+    DependsOn: WorkshopBucketCleanup
+
+  PlaybookKbDocuments:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt 'KnowledgeBaseDocumentFunction.Arn'
+      BucketName: !Ref 'PlaybookKbDataBucket'
+      Dataset: playbook
+      DatasetVersion: '2026-09-24'
+    DependsOn: WorkshopBucketCleanup
+
+  PlaybookMemory:
+    Type: AWS::BedrockAgentCore::Memory
+    Properties:
+      Name: customersupport_playbook
+      Description: Conversation memory for the optimization playbook
+      EventExpiryDuration: 7
+      MemoryExecutionRoleArn: !GetAtt 'RuntimeAgentCoreRole.Arn'
+      MemoryStrategies:
+      - SemanticMemoryStrategy:
+          Name: UserFacts
+          Namespaces:
+          - /users/{actorId}/facts
+      Tags:
+        Application: CustomerSupport
+        WorkshopStack: !Ref 'AWS::StackId'
+
+  PlaybookMemoryParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /app/customersupport/agentcore/memory_id
+      Type: String
+      Value: !GetAtt 'PlaybookMemory.MemoryId'
+      Tags:
+        Application: CustomerSupport
+
+  WorkshopBucketCleanupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: WorkshopAccess
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:GetBucketTagging
+            - s3:ListBucket
+            - s3:ListBucketVersions
+            - s3:ListBucketMultipartUploads
+            Resource:
+            - !GetAtt 'LambdaCodeBucket.Arn'
+            - !GetAtt 'BedrockKnowledgeBaseDataBucket.Arn'
+            - !GetAtt 'PlaybookKbDataBucket.Arn'
+            - !GetAtt 'PlaybookBatchBucket.Arn'
+            - !GetAtt 'AgentCoreCodeBucket.Arn'
+          - Effect: Allow
+            Action:
+            - s3:DeleteObject
+            - s3:DeleteObjectVersion
+            - s3:AbortMultipartUpload
+            Resource:
+            - !Sub '${LambdaCodeBucket.Arn}/*'
+            - !Sub '${BedrockKnowledgeBaseDataBucket.Arn}/*'
+            - !Sub '${PlaybookKbDataBucket.Arn}/*'
+            - !Sub '${PlaybookBatchBucket.Arn}/*'
+            - !Sub '${AgentCoreCodeBucket.Arn}/*'
+      Tags:
+      - Key: Application
+        Value: CustomerSupport
+      - Key: WorkshopStack
+        Value: !Ref 'AWS::StackId'
+      ManagedPolicyArns:
+      - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+
+  WorkshopBucketCleanupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt 'WorkshopBucketCleanupRole.Arn'
+      Timeout: 900
+      MemorySize: 512
       Code:
         ZipFile: |
           import boto3
           import cfnresponse
-          import json
+          from botocore.config import Config
+          from botocore.exceptions import ClientError
 
-          def lambda_handler(event, context):
-              response_data = {
-                  'Status': 'UNKNOWN',
-                  'FilesUploaded': 0,
-                  'S3Bucket': 'unknown',
-                  'KnowledgeBaseId': 'not-created',
-                  'DataSourceId': 'not-created',
-                  'ParameterStoreCreated': 'NO',
-                  'Error': 'No error'
-              }
-              
+          def empty_bucket(s3, bucket, stack_id, context):
+              try:
+                  tags = {t['Key']: t['Value'] for t in s3.get_bucket_tagging(Bucket=bucket)['TagSet']}
+              except ClientError as error:
+                  if error.response['Error']['Code'] == 'NoSuchBucket':
+                      return
+                  raise
+              if tags.get('WorkshopStack') != stack_id:
+                  raise ValueError('Refusing to empty bucket without this stack ownership tag: ' + bucket)
+              # ListObjectVersions includes unversioned objects (VersionId=null), historical
+              # versions and delete markers. Check partial DeleteObjects errors explicitly.
+              for page in s3.get_paginator('list_object_versions').paginate(Bucket=bucket):
+                  if context.get_remaining_time_in_millis() < 45000:
+                      raise TimeoutError('Bucket cleanup timed out; retry stack deletion')
+                  objects = [{'Key': obj['Key'], 'VersionId': obj['VersionId']}
+                             for kind in ('Versions', 'DeleteMarkers') for obj in page.get(kind, [])]
+                  for offset in range(0, len(objects), 1000):
+                      result = s3.delete_objects(Bucket=bucket, Delete={'Objects': objects[offset:offset+1000], 'Quiet': True})
+                      if result.get('Errors'):
+                          raise RuntimeError('S3 deletion failed: ' + str(result['Errors']))
+              for page in s3.get_paginator('list_multipart_uploads').paginate(Bucket=bucket):
+                  for upload in page.get('Uploads', []):
+                      s3.abort_multipart_upload(Bucket=bucket, Key=upload['Key'], UploadId=upload['UploadId'])
+
+          def handler(event, context):
+              physical_id = event.get('PhysicalResourceId', event['LogicalResourceId'])
               try:
                   if event['RequestType'] == 'Delete':
-                      response_data.update({
-                          'Status': 'DELETED',
-                          'Error': 'Stack deleted successfully'
-                      })
-                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
-                      return
+                      s3 = boto3.client('s3', config=Config(connect_timeout=5, read_timeout=20,
+                          retries={'max_attempts': 3, 'mode': 'standard'}))
+                      for bucket in event['ResourceProperties']['BucketNames']:
+                          empty_bucket(s3, bucket, event['StackId'], context)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physical_id)
+              except Exception as error:
+                  cfnresponse.send(event, context, cfnresponse.FAILED,
+                                   {'Error': str(error)[:1000]}, physical_id)
 
-                  data_bucket_name = event['ResourceProperties']['BucketName']
-                  execution_role_arn = event['ResourceProperties']['BedrockRoleArn']
-                  response_data['S3Bucket'] = data_bucket_name
-                  
-                  print(f"Starting setup with bucket: {data_bucket_name}")
-                  
-                  # Create documentation content
-                  docs = {}
-                  docs['troubleshooting-guide.txt'] = """Common Electronics Troubleshooting Guide
+  WorkshopBucketCleanup:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt 'WorkshopBucketCleanupFunction.Arn'
+      BucketNames:
+      - !Ref 'LambdaCodeBucket'
+      - !Ref 'BedrockKnowledgeBaseDataBucket'
+      - !Ref 'PlaybookKbDataBucket'
+      - !Ref 'PlaybookBatchBucket'
+      - !Ref 'AgentCoreCodeBucket'
 
-          POWER ISSUES
-          1. Device won't turn on
-             - Check power cable connections
-             - Verify power outlet functionality  
-             - Try different power cable if available
-             - Check for physical damage to device
-
-          2. Device turns off unexpectedly
-             - Check for overheating
-             - Verify power supply capacity
-             - Update device firmware
-             - Check for loose connections
-
-          CONNECTIVITY ISSUES  
-          1. Wi-Fi connection problems
-             - Restart router and device
-             - Check Wi-Fi password accuracy
-             - Update network drivers
-             - Reset network settings
-
-          2. Bluetooth pairing issues
-             - Clear Bluetooth cache
-             - Remove and re-pair devices
-             - Check compatibility
-             - Update Bluetooth drivers
-
-          PERFORMANCE ISSUES
-          1. Slow performance
-             - Close unnecessary applications
-             - Check available storage space
-             - Run system updates
-             - Clear cache and temporary files
-
-          2. Audio and Video problems
-             - Check cable connections
-             - Update audio and video drivers
-             - Verify settings configuration
-             - Test with different media"""
-
-                  docs['laptop-maintenance-guide.txt'] = """Laptop Maintenance and Care Guide
-
-          DAILY CARE
-          - Keep laptop on hard flat surfaces for proper ventilation
-          - Avoid eating or drinking near the laptop
-          - Clean screen gently with microfiber cloth
-          - Close laptop carefully without slamming
-
-          WEEKLY MAINTENANCE
-          - Clean keyboard with compressed air
-          - Wipe down exterior with damp cloth
-          - Check for software updates
-          - Empty downloads and temp folders
-
-          MONTHLY TASKS
-          - Deep clean vents and fans
-          - Check battery health and calibrate
-          - Update all drivers and software
-          - Run disk cleanup and defragmentation
-          - Backup important data
-
-          PERFORMANCE OPTIMIZATION
-          - Uninstall unused programs
-          - Manage startup programs
-          - Check hard drive health
-          - Monitor temperature levels
-          - Keep 15-20% disk space free
-
-          WARNING SIGNS
-          - Excessive heat generation
-          - Unusual fan noise
-          - Slow boot times
-          - Frequent crashes or freezes
-          - Reduced battery life"""
-
-                  docs['smartphone-setup-guide.txt'] = """Smartphone Initial Setup and Configuration Guide
-
-          FIRST-TIME SETUP
-          1. Charge device to at least 50% before first use
-          2. Insert SIM card if applicable
-          3. Power on and follow setup wizard
-          4. Connect to Wi-Fi network
-          5. Sign in to your account Apple ID or Google Account
-          6. Configure security PIN fingerprint face unlock
-          7. Restore from backup or set up as new device
-
-          SECURITY CONFIGURATION
-          - Enable automatic screen lock
-          - Set up biometric authentication
-          - Configure Find My Device or Find My iPhone
-          - Enable automatic app updates
-          - Set up two-factor authentication
-
-          ESSENTIAL APPS
-          - Email client configuration
-          - Banking and payment apps
-          - Navigation and maps
-          - Communication apps
-          - Backup and cloud storage
-
-          BATTERY OPTIMIZATION
-          - Enable battery optimization settings
-          - Adjust screen brightness and timeout
-          - Manage background app refresh
-          - Configure location services
-          - Set up low power mode
-
-          DATA MANAGEMENT
-          - Configure cloud backup schedules
-          - Set up automatic photo backup
-          - Manage storage and cleanup
-          - Configure data usage limits
-          - Set up family sharing if applicable"""
-
-                  docs['monitor-calibration-guide.txt'] = """Monitor Setup and Calibration Guide
-
-          PHYSICAL SETUP
-          - Position monitor at arms length 20-26 inches
-          - Top of screen at or below eye level
-          - Minimize glare from windows and lights
-          - Ensure stable desk placement
-
-          DISPLAY SETTINGS
-          1. Resolution - Set to native resolution
-          2. Brightness - 120-150 cd per m² for office use
-          3. Contrast - 1000 to 1 ratio recommended
-          4. Color temperature - 6500K for general use
-          5. Gamma - 2.2 for Windows 1.8 for Mac
-
-          COLOR CALIBRATION
-          - Use built-in calibration tools
-          - Consider hardware colorimeter for precision
-          - Calibrate monthly for professional work
-          - Save custom color profiles
-
-          ERGONOMIC CONSIDERATIONS
-          - Monitor height adjustment
-          - Tilt angle 10-20 degrees back
-          - Multiple monitor alignment
-          - Proper lighting setup
-
-          TROUBLESHOOTING
-          - Flickering - Check cable connections and refresh rate
-          - Color issues - Update graphics drivers
-          - Blurry text - Verify native resolution
-          - Dead pixels - Check warranty coverage"""
-
-                  docs['wireless-connectivity-guide.txt'] = """Wireless Connectivity Setup and Troubleshooting
-
-          WI-FI SETUP
-          1. Locate network settings in device
-          2. Select your network from available list
-          3. Enter network password carefully
-          4. Configure network security settings
-          5. Test internet connectivity
-
-          BLUETOOTH PAIRING
-          1. Enable Bluetooth on both devices
-          2. Put accessory in pairing mode
-          3. Select device from available list
-          4. Complete pairing process
-          5. Test functionality
-
-          COMMON WI-FI ISSUES
-          - Weak signal - Move closer to router check for interference
-          - Slow speeds - Check bandwidth usage update router firmware
-          - Connection drops - Update network drivers check power saving
-          - Cannot connect - Verify password restart network adapter
-
-          BLUETOOTH TROUBLESHOOTING
-          - Pairing fails - Clear Bluetooth cache restart both devices
-          - Audio stuttering - Check for interference update drivers
-          - Connection unstable - Verify compatibility check battery levels
-          - Device not found - Ensure proper pairing mode activation
-
-          SECURITY CONSIDERATIONS
-          - Use WPA3 encryption when available
-          - Regularly update device firmware
-          - Avoid public Wi-Fi for sensitive activities
-          - Monitor connected devices regularly"""
-
-                  docs['warranty-service-guide.txt'] = """Warranty and Service Information Guide
-
-          WARRANTY COVERAGE
-          - Manufacturing defects - Full coverage
-          - Normal wear and tear - Not covered
-          - Accidental damage - Extended warranty plans available
-          - Water damage - Generally not covered check IP rating
-          - Software issues - Covered if not user-caused
-
-          WARRANTY CLAIMS PROCESS
-          1. Gather proof of purchase and serial number
-          2. Contact technical support for diagnosis
-          3. Complete warranty claim form
-          4. Package device securely for shipping
-          5. Track repair status through online portal
-
-          SERVICE OPTIONS
-          - In-warranty repairs - Free parts and labor
-          - Out-of-warranty repairs - Quote provided before service
-          - Express service - Available for additional fee
-          - On-site service - Available for business customers
-
-          EXTENDED WARRANTY PLANS
-          - Accidental damage protection
-          - Extended coverage periods
-          - Premium technical support
-          - Replacement device programs
-
-          SUPPORT CHANNELS
-          - Online chat - 24/7 availability
-          - Phone support - Business hours
-          - Email support - 24-hour response
-          - Video troubleshooting - Appointment based"""
-
-                  s3_client = boto3.client('s3')
-                  uploaded_count = 0
-                  
-                  for filename, content in docs.items():
-                      try:
-                          print(f"Uploading {filename}...")
-                          s3_client.put_object(
-                              Bucket=data_bucket_name,
-                              Key=filename,
-                              Body=content.strip().encode('utf-8'),
-                              ContentType='text/plain'
-                          )
-                          uploaded_count += 1
-                          print(f"Successfully uploaded {filename}")
-                      except Exception as e:
-                          print(f"Failed to upload {filename}: {str(e)}")
-                  
-                  response_data['FilesUploaded'] = uploaded_count
-                  
-                  if uploaded_count == 0:
-                      response_data.update({
-                          'Status': 'FAILED',
-                          'Error': 'No documentation files were uploaded successfully'
-                      })
-                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
-                      return
-                  
-                  try:
-                      s3vectors = boto3.client('s3vectors')
-                      bedrock = boto3.client('bedrock-agent')
-                  except Exception as e:
-                      response_data.update({
-                          'Status': 'FAILED',
-                          'Error': f'Client initialization failed: {str(e)}'
-                      })
-                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
-                      return
-                  
-                  account_id = context.invoked_function_arn.split(':')[4]
-                  region = context.invoked_function_arn.split(':')[3]
-                  
-                  vector_bucket_name = f"{account_id}-{region}-kb-vector-bucket"
-                  index_name = f"{account_id}-{region}-kb-vector-index"
-                  kb_name = f"{account_id}-{region}-kb"
-                  datasource_name = f"{account_id}-{region}-kb-datasource"
-
-                  response_data.update({
-                    'VectorBucketName': vector_bucket_name,
-                    'KnowledgeBaseName': kb_name,
-                    'DataSourceName': datasource_name
-                  })
-                  
-                  try:
-                      print(f"Creating S3 vector bucket: {vector_bucket_name}")
-                      s3vectors.create_vector_bucket(
-                          vectorBucketName=vector_bucket_name,
-                          encryptionConfiguration={'sseType': 'AES256'}
-                      )
-                      
-                      print(f"Creating vector index: {index_name}")
-                      s3vectors.create_index(
-                          vectorBucketName=vector_bucket_name,
-                          indexName=index_name,
-                          dimension=1024,
-                          distanceMetric='cosine',
-                          dataType='float32'
-                      )
-                      
-                      index_arn = f"arn:aws:s3vectors:{region}:{account_id}:bucket/{vector_bucket_name}/index/{index_name}"
-                      
-                      print(f"Creating knowledge base: {kb_name}")
-                      kb_response = bedrock.create_knowledge_base(
-                          name=kb_name,
-                          roleArn=execution_role_arn,
-                          knowledgeBaseConfiguration={
-                              'type': 'VECTOR',
-                              'vectorKnowledgeBaseConfiguration': {
-                                  'embeddingModelArn': f'arn:aws:bedrock:{region}::foundation-model/amazon.titan-embed-text-v2:0',
-                                  'embeddingModelConfiguration': {
-                                      'bedrockEmbeddingModelConfiguration': {
-                                          'dimensions': 1024,
-                                          'embeddingDataType': 'FLOAT32'
-                                      }
-                                  }
-                              }
-                          },
-                          storageConfiguration={
-                              'type': 'S3_VECTORS',
-                              's3VectorsConfiguration': {
-                                  'indexArn': index_arn
-                              }
-                          }
-                      )
-                      
-                      kb_id = kb_response['knowledgeBase']['knowledgeBaseId']
-                      
-                      print(f"Creating data source: {datasource_name}")
-                      ds_response = bedrock.create_data_source(
-                          knowledgeBaseId=kb_id,
-                          name=datasource_name,
-                          dataSourceConfiguration={
-                              'type': 'S3',
-                              's3Configuration': {
-                                  'bucketArn': f"arn:aws:s3:::{data_bucket_name}"
-                              }
-                          },
-                          vectorIngestionConfiguration={
-                              'chunkingConfiguration': {
-                                  'chunkingStrategy': 'FIXED_SIZE',
-                                  'fixedSizeChunkingConfiguration': {
-                                      'maxTokens': 200,
-                                      'overlapPercentage': 10
-                                  }
-                              }
-                          }
-                      )
-                      
-                      ds_id = ds_response['dataSource']['dataSourceId']
-                      
-                      response_data.update({
-                          'KnowledgeBaseId': kb_id,
-                          'DataSourceId': ds_id,
-                          'VectorBucketName': vector_bucket_name,
-                          'IndexArn': index_arn,
-                          'KnowledgeBaseName': kb_name,
-                          'DataSourceName': datasource_name
-                      })
-                      
-                      print("Creating Parameter Store entries...")
-                      ssm_client = boto3.client('ssm')
-                      
-                      try:
-                          ssm_client.put_parameter(
-                              Name=f"/{account_id}-{region}/kb/knowledge-base-id",
-                              Value=kb_id,
-                              Type='String',
-                              Description='Electronics Support Knowledge Base ID',
-                              Overwrite=True
-                          )
-                          
-                          ssm_client.put_parameter(
-                              Name=f"/{account_id}-{region}/kb/data-source-id",
-                              Value=ds_id,
-                              Type='String',
-                              Description='Electronics Support Data Source ID',
-                              Overwrite=True
-                          )
-                          
-                          response_data.update({
-                              'Status': 'SUCCESS',
-                              'ParameterStoreCreated': 'YES',
-                              'Error': 'Electronics support knowledge base created successfully'
-                          })
-                          
-                      except Exception as ssm_error:
-                          response_data.update({
-                              'Status': 'PARTIAL_SUCCESS',
-                              'ParameterStoreCreated': f'FAILED: {str(ssm_error)}',
-                              'Error': f'Parameter Store creation failed: {str(ssm_error)}'
-                          })
-                      
-                      print("Electronics support knowledge base setup completed!")
-                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
-                      
-                  except Exception as e:
-                      print(f"Knowledge base creation failed: {str(e)}")
-                      response_data.update({
-                          'Status': 'PARTIAL_SUCCESS',
-                          'Error': f"Knowledge base creation failed: {str(e)}"
-                      })
-                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
-                      
-              except Exception as e:
-                  print(f"Critical error: {str(e)}")
-                  response_data.update({
-                      'Status': 'FAILED',
-                      'Error': f"Critical error: {str(e)}"
-                  })
-                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
-
-  KnowledgeBaseSetupRole:
+  TransactionSearchSetupRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub '${AWS::AccountId}-${AWS::Region}-kb-setup-function-role'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
       Policies:
-        - PolicyName: KnowledgeBaseSetupPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - s3:PutObject
-                  - s3:PutObjectAcl
-                  - s3:ListBucket
-                Resource:
-                  - !GetAtt BedrockKnowledgeBaseDataBucket.Arn
-                  - !Sub '${BedrockKnowledgeBaseDataBucket.Arn}/*'
-              - Effect: Allow
-                Action:
-                  - s3vectors:CreateVectorBucket
-                  - s3vectors:CreateIndex
-                  - s3vectors:GetVectorBucket
-                  - s3vectors:GetIndex
-                Resource: '*'
-              - Effect: Allow
-                Action:
-                  - bedrock:CreateKnowledgeBase
-                  - bedrock:CreateDataSource
-                Resource: '*'
-              - Effect: Allow
-                Action:
-                  - iam:PassRole
-                Resource: !GetAtt BedrockServiceRole.Arn
-              - Effect: Allow
-                Action:
-                  - ssm:PutParameter
-                  - ssm:GetParameter
-                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*'
+      - PolicyName: WorkshopAccess
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - xray:GetTraceSegmentDestination
+            - xray:UpdateTraceSegmentDestination
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - logs:DescribeResourcePolicies
+            - logs:PutResourcePolicy
+            Resource: '*'
+          # UpdateTraceSegmentDestination creates/configures these service log groups
+          # using the caller's permissions when Transaction Search is first enabled.
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutRetentionPolicy
+            Resource:
+            - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans'
+            - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans:*'
+            - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/application-signals/data'
+            - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/application-signals/data:*'
+          - Effect: Allow
+            Action: application-signals:StartDiscovery
+            Resource: '*'
+          - Effect: Allow
+            Action: iam:CreateServiceLinkedRole
+            Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/application-signals.cloudwatch.amazonaws.com/AWSServiceRoleForCloudWatchApplicationSignals'
+            Condition:
+              StringEquals:
+                iam:AWSServiceName: application-signals.cloudwatch.amazonaws.com
+          - Effect: Allow
+            Action: iam:GetRole
+            Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/application-signals.cloudwatch.amazonaws.com/AWSServiceRoleForCloudWatchApplicationSignals'
+          - Effect: Allow
+            Action: cloudtrail:CreateServiceLinkedChannel
+            Resource: !Sub 'arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:channel/aws-service-channel/application-signals/*'
+      Tags:
+      - Key: Application
+        Value: CustomerSupport
+      - Key: WorkshopStack
+        Value: !Ref 'AWS::StackId'
+      ManagedPolicyArns:
+      - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
 
-  # Trigger the setup
-  KnowledgeBaseSetup:
+  TransactionSearchSetupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt 'TransactionSearchSetupRole.Arn'
+      Timeout: 900
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          import json
+          import time
+          import boto3
+          import cfnresponse
+          from botocore.config import Config
+
+          POLICY_NAME = 'TransactionSearchXRayAccess'
+
+          def enable(event, context):
+              config = Config(connect_timeout=5, read_timeout=20, retries={'max_attempts': 3, 'mode': 'standard'})
+              xray = boto3.client('xray', config=config)
+              state = xray.get_trace_segment_destination()
+              preserved = state.get('Destination') == 'CloudWatchLogs'
+              if not preserved:
+                  logs = boto3.client('logs', config=config)
+                  policies, token = [], None
+                  while True:
+                      page = logs.describe_resource_policies(**({'nextToken': token} if token else {}))
+                      policies.extend(page.get('resourcePolicies', []))
+                      token = page.get('nextToken')
+                      if not token:
+                          break
+                  # Never replace a customer's existing policy, even when TS is currently off.
+                  if not any(p['policyName'] == POLICY_NAME for p in policies):
+                      arn_parts = context.invoked_function_arn.split(':')
+                      partition, region, account = arn_parts[1], arn_parts[3], arn_parts[4]
+                      prefix = f'arn:{partition}:logs:{region}:{account}:log-group:'
+                      policy = {'Version': '2012-10-17', 'Statement': [{
+                          'Effect': 'Allow', 'Principal': {'Service': 'xray.amazonaws.com'},
+                          'Action': 'logs:PutLogEvents',
+                          'Resource': [prefix + 'aws/spans:*', prefix + '/aws/application-signals/data:*'],
+                          'Condition': {'StringEquals': {'aws:SourceAccount': account},
+                                        'ArnLike': {'aws:SourceArn': f'arn:{partition}:xray:{region}:{account}:*'}}}]}
+                      logs.put_resource_policy(policyName=POLICY_NAME, policyDocument=json.dumps(policy))
+                  # Do not alter the account's indexing percentage or other logging configuration.
+                  xray.update_trace_segment_destination(Destination='CloudWatchLogs')
+              # First-time activation can take ten minutes; preserve callback time.
+              deadline = time.monotonic() + min(720, context.get_remaining_time_in_millis() / 1000 - 45)
+              while time.monotonic() < deadline:
+                  state = xray.get_trace_segment_destination()
+                  if state.get('Destination') == 'CloudWatchLogs' and state.get('Status') == 'ACTIVE':
+                      return {'AlreadyEnabled': preserved, 'Destination': 'CloudWatchLogs', 'Status': 'ACTIVE'}
+                  if state.get('Status') == 'FAILED':
+                      raise RuntimeError('Transaction Search activation failed')
+                  time.sleep(5)
+              raise TimeoutError('Transaction Search did not become ACTIVE before the callback deadline')
+
+          def handler(event, context):
+              physical_id = event.get('PhysicalResourceId', event['LogicalResourceId'])
+              try:
+                  data = {'Status': 'PRESERVED'} if event['RequestType'] == 'Delete' else enable(event, context)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, data, physical_id)
+              except Exception as error:
+                  cfnresponse.send(event, context, cfnresponse.FAILED,
+                                   {'Error': str(error)[:1000]}, physical_id)
+      Layers:
+      - !Ref 'Boto3Layer'
+
+  TransactionSearchSetup:
     Type: AWS::CloudFormation::CustomResource
     Properties:
-      ServiceToken: !GetAtt KnowledgeBaseSetupFunction.Arn
-      BucketName: !Ref BedrockKnowledgeBaseDataBucket
-      BedrockRoleArn: !GetAtt BedrockServiceRole.Arn
+      ServiceToken: !GetAtt 'TransactionSearchSetupFunction.Arn'
+      Revision: '2026-09-24'
+
 
 Outputs:
   S3DataBucketName:
-    Description: 'S3 bucket containing electronics technical documentation'
-    Value: !Ref BedrockKnowledgeBaseDataBucket
-
+    Description: S3 bucket containing electronics technical documentation
+    Value: !Ref 'BedrockKnowledgeBaseDataBucket'
   SetupStatus:
-    Description: 'Setup completion status'
-    Value: !GetAtt KnowledgeBaseSetup.Status
-
+    Description: Setup completion status
+    Value: !GetAtt 'KnowledgeBaseSetup.Status'
   FilesUploaded:
-    Description: 'Number of technical documentation files uploaded'
-    Value: !GetAtt KnowledgeBaseSetup.FilesUploaded
-
+    Description: Number of technical documentation files uploaded
+    Value: !GetAtt 'KnowledgeBaseSetup.FilesUploaded'
   KnowledgeBaseId:
-    Description: 'Electronics Support Knowledge Base ID'
-    Value: !GetAtt KnowledgeBaseSetup.KnowledgeBaseId
-
+    Description: Electronics Support Knowledge Base ID
+    Value: !GetAtt 'KnowledgeBase.KnowledgeBaseId'
   DataSourceId:
-    Description: 'Electronics Support Data Source ID'
-    Value: !GetAtt KnowledgeBaseSetup.DataSourceId
-
+    Description: Electronics Support Data Source ID
+    Value: !GetAtt 'KnowledgeBaseDataSource.DataSourceId'
   VectorBucketName:
-    Description: 'S3 Vector Bucket Name'
-    Value: !GetAtt KnowledgeBaseSetup.VectorBucketName
-
+    Description: Developer Journey storage is managed by Bedrock; no customer vector bucket
+    Value: MANAGED
   KnowledgeBaseName:
-    Description: 'Knowledge Base Name'
-    Value: !GetAtt KnowledgeBaseSetup.KnowledgeBaseName
-
+    Description: Knowledge Base Name
+    Value: !Sub '${AWS::AccountId}-${AWS::Region}-kb-managed'
   DataSourceName:
-    Description: 'Data Source Name'
-    Value: !GetAtt KnowledgeBaseSetup.DataSourceName
-
+    Description: Data Source Name
+    Value: !Sub '${AWS::AccountId}-${AWS::Region}-kb-managed-datasource'
   ParameterStoreCreated:
-    Description: 'Whether Parameter Store parameters were created'
-    Value: !GetAtt KnowledgeBaseSetup.ParameterStoreCreated
-
+    Description: Whether Parameter Store parameters were created
+    Value: 'YES'
   ParameterStoreKnowledgeBaseId:
-    Description: 'Parameter Store path for Knowledge Base ID'
-    Value: !Sub '${AWS::AccountId}-${AWS::Region}/kb/knowledge-base-id'
-
-  ParameterStoreDataSourceId:
-    Description: 'Parameter Store path for Data Source ID'
-    Value: !Sub '${AWS::AccountId}-${AWS::Region}/kb/data-source-id'
-
+    Description: Parameter Store path for Knowledge Base ID
+    Value: !Sub '/${AWS::AccountId}-${AWS::Region}/kb/knowledge-base-id'
+  PlaybookKnowledgeBaseId:
+    Description: Optimization Playbook RAG Knowledge Base ID
+    Value: !GetAtt 'PlaybookKnowledgeBase.KnowledgeBaseId'
+  PlaybookKbStatus:
+    Description: Playbook KB setup + ingestion status
+    Value: !GetAtt 'PlaybookKbSetup.Status'
+  ParameterStorePlaybookKnowledgeBaseId:
+    Description: Parameter Store path for the Playbook RAG Knowledge Base ID
+    Value: !Sub '/${AWS::AccountId}-${AWS::Region}/playbook-kb/knowledge-base-id'
+  ParameterStorePlaybookDataSourceId:
+    Description: Parameter Store path for the Playbook RAG Data Source ID
+    Value: !Sub '/${AWS::AccountId}-${AWS::Region}/playbook-kb/data-source-id'
   ErrorMessage:
-    Description: 'Error message or success confirmation'
-    Value: !GetAtt KnowledgeBaseSetup.Error
+    Description: Error message or success confirmation
+    Value: !GetAtt 'KnowledgeBaseSetup.Error'
+  AgentCoreCodeBucketName:
+    Description: S3 bucket for Linux ARM64 direct-code Runtime ZIP artifacts
+    Value: !Ref 'AgentCoreCodeBucket'

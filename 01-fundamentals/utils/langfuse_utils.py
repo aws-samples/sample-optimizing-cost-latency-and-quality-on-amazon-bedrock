@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from functools import lru_cache
 from typing import Any
 from urllib.parse import urlparse
 
@@ -9,8 +10,6 @@ import requests
 from botocore.exceptions import ClientError
 from langfuse import get_client, observe
 from langfuse.model import PromptClient
-
-langfuse = get_client()
 
 MODEL_CONFIG = {
     "sonnet": {
@@ -29,11 +28,15 @@ GUARDRAIL_CONFIG = {
     "trace": "enabled",
 }
 
-# used to invoke the Bedrock Converse API
-bedrock_runtime = boto3.client(
-    service_name="bedrock-runtime",
-    region_name="us-east-1",
-)
+
+@lru_cache(maxsize=1)
+def _bedrock_runtime():
+    """Create the optional legacy client's AWS session only on first use.
+
+    Call workshop_utils.observability.setup_observability before invoking this
+    module's wrappers so ADOT owns initialization when both exporters are used.
+    """
+    return boto3.client(service_name="bedrock-runtime", region_name="us-east-1")
 
 
 def convert_to_bedrock_messages(
@@ -89,6 +92,7 @@ def converse(
     metadata: dict[str, Any] | None = None,
     **kwargs,
 ) -> str | None:
+    langfuse = get_client()
     if metadata is None:
         metadata = {}
     kwargs_clone = kwargs.copy()
@@ -107,7 +111,7 @@ def converse(
     system_prompts, messages = convert_to_bedrock_messages(messages)
 
     try:
-        response = bedrock_runtime.converse(
+        response = _bedrock_runtime().converse(
             modelId=model_id,
             system=system_prompts,
             messages=messages,
@@ -146,6 +150,7 @@ def converse_tool_use(
     metadata: dict[str, Any] | None = None,
     **kwargs,
 ) -> list[dict] | None:
+    langfuse = get_client()
     if metadata is None:
         metadata = {}
     kwargs_clone = kwargs.copy()
@@ -186,7 +191,7 @@ def converse_tool_use(
         }
 
     try:
-        response = bedrock_runtime.converse(
+        response = _bedrock_runtime().converse(
             modelId=model_id,
             system=system_prompts,
             messages=messages,
@@ -243,6 +248,7 @@ def converse_tool_use(
 
 @observe(as_type="span", name="Tool Execution")
 def _execute_tool_span(tool_id: str, tool_name: str, tool_input: str) -> dict:
+    langfuse = get_client()
     langfuse.update_current_span(
         input={"tool_id": tool_id, "tool_name": tool_name, "arguments": tool_input},
         output={"status": "completed", "result": json.loads(tool_input)},

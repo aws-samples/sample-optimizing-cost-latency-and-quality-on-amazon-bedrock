@@ -1,7 +1,6 @@
-# Ruff configuration (based on ruff's own config)
-# https://github.com/astral-sh/ruff/blob/main/pyproject.toml
+# Canonical Ruff policy; pyproject.toml extends this file for explicit --config runs.
 
-target-version = "py311"
+target-version = "py313"
 line-length = 119
 
 extend-exclude = [
@@ -29,8 +28,16 @@ select = [
 ignore = [
     "B011",  # assert-false
     "E501",  # line-too-long
-    "E402",  # module-import-not-at-top-of-file (notebooks need load_dotenv() first)
 ]
+
+[lint.per-file-ignores]
+# Notebook setup adjusts sys.path / loads environment before importing helpers.
+# Imports also support learner exploration across cells; do not auto-remove them.
+# Notebooks do not require a module-wide future-annotations import.
+"*.ipynb" = ["E402", "F401", "I002"]
+# These entry points deliberately configure imports before loading dependencies.
+"03-developer-journey/utils/ragas_eval.py" = ["E402"]  # Install the legacy warning filter.
+"04-deep-dive-topics/scripts/run_agentcore_gate.py" = ["E402"]  # Locate the source ZIP root.
 
 [lint.isort]
 required-imports = ["from __future__ import annotations"]
