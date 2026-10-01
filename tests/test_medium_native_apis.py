@@ -6,6 +6,7 @@ import ast
 import copy
 import hashlib
 import importlib.util
+import io
 import json
 import sys
 import time
@@ -20,7 +21,9 @@ import boto3
 import pytest
 from botocore.config import Config
 from botocore.endpoint import Endpoint
+from botocore.exceptions import ClientError
 from botocore.stub import Stubber
+from botocore.validate import validate_parameters
 
 ROOT = Path(__file__).resolve().parents[1]
 NOTEBOOK = ROOT / "02-optimization-playbook/02-medium-effort.ipynb"
@@ -69,6 +72,36 @@ def retrieval_request(kb_id=KB_ID, *, kind="vector", count=3, **extra):
     }
 
 
+def cohere_preflight_fixture(availability=None):
+    order, bodies = [], []
+    availability = availability or {
+        "modelId": "cohere.rerank-v3-5:0",
+        "agreementAvailability": {"status": "AVAILABLE"},
+        "authorizationStatus": "AUTHORIZED",
+        "entitlementAvailability": "AVAILABLE",
+        "regionAvailability": "AVAILABLE",
+    }
+
+    def invoke(**request):
+        order.append("invoke")
+        body = io.BytesIO(json.dumps({
+            "results": [{"index": 0, "relevance_score": 0.98},
+                        {"index": 1, "relevance_score": 0.12}],
+        }).encode())
+        bodies.append(body)
+        return {"body": body, "contentType": "application/json"}
+
+    def inspect_availability(**request):
+        order.append("availability")
+        return copy.deepcopy(availability)
+
+    return {
+        "RUNTIME": SimpleNamespace(invoke_model=Mock(side_effect=invoke)),
+        "BEDROCK": SimpleNamespace(get_foundation_model_availability=Mock(side_effect=inspect_availability)),
+        "_cohere_order": order, "_cohere_bodies": bodies,
+    }
+
+
 def test_vector_filter_rerank_and_managed_requests_keep_query_and_sources(sdk_session):
     client = sdk_session.client("bedrock-agent-runtime")
     metadata_filter = {
@@ -86,11 +119,12 @@ def test_vector_filter_rerank_and_managed_requests_keep_query_and_sources(sdk_se
             },
         },
     }
-    requests = [retrieval_request(count=k) for k in (5, 4, 3)]
+    requests = [retrieval_request(count=k, filter=metadata_filter) for k in (5, 4, 3)]
     requests += [
         retrieval_request(count=5),
         retrieval_request(count=5, filter=metadata_filter),
-        retrieval_request(count=10, rerankingConfiguration=reranking),
+        retrieval_request(count=10, filter=metadata_filter),
+        retrieval_request(count=10, filter=metadata_filter, rerankingConfiguration=reranking),
         retrieval_request(MANAGED_ID, kind="managed"),
     ]
     control = SimpleNamespace(get_knowledge_base=Mock(return_value={
@@ -98,6 +132,7 @@ def test_vector_filter_rerank_and_managed_requests_keep_query_and_sources(sdk_se
     }))
     printed = []
     namespace = {
+        **cohere_preflight_fixture(),
         "KB_ID": KB_ID, "QUERY": QUERY, "REGION": "us-east-1",
         "KB_RUNTIME": client, "KB_CONTROL": control,
         "os": SimpleNamespace(environ={
@@ -113,7 +148,258 @@ def test_vector_filter_rerank_and_managed_requests_keep_query_and_sources(sdk_se
     assert namespace["hits"] == [PASSAGE]
     assert printed[0]["sources"] == [PASSAGE["location"]]
     assert printed[-1] == PASSAGE
+    assert namespace["retrieval_candidates"] == [PASSAGE]
+    assert namespace["retrieval_only_hits"] == [PASSAGE]
+    assert namespace["reranked_hits"] == [PASSAGE]
     control.get_knowledge_base.assert_called_once_with(knowledgeBaseId=MANAGED_ID)
+
+
+@pytest.mark.parametrize("count", [0, 1, 2, 5])
+def test_rerank_comparison_bounds_context_without_padding_small_fixture(count):
+    hits = [{**PASSAGE, "content": {"text": f"Policy passage {i}"}} for i in range(count)]
+    retrieval = Mock(side_effect=lambda **kwargs: {
+        "retrievalResults": hits[:3] if "rerankingConfiguration" in
+        kwargs["retrievalConfiguration"]["vectorSearchConfiguration"] else hits,
+    })
+    namespace = {
+        **cohere_preflight_fixture(),
+        "KB_ID": KB_ID, "QUERY": QUERY, "REGION": "us-east-1",
+        "KB_RUNTIME": SimpleNamespace(retrieve=retrieval),
+        "os": SimpleNamespace(environ={"RUN_RERANK": "1"}),
+        "print": Mock(),
+    }
+    execute("medium-12-e12b8aef", namespace)
+    baseline, reranked = [call.kwargs for call in retrieval.call_args_list[-2:]]
+    reranked_config = copy.deepcopy(reranked["retrievalConfiguration"]["vectorSearchConfiguration"])
+    reranked_config.pop("rerankingConfiguration")
+    assert baseline["retrievalConfiguration"]["vectorSearchConfiguration"] == reranked_config
+    assert baseline["retrievalQuery"] == reranked["retrievalQuery"] == {"text": QUERY}
+    assert baseline["knowledgeBaseId"] == reranked["knowledgeBaseId"] == KB_ID
+    assert namespace["retrieval_candidates"] == hits
+    assert namespace["retrieval_only_hits"] == namespace["reranked_hits"] == hits[:3]
+
+
+def rerank_error_fixture(code, message):
+    error = ClientError({
+        "Error": {"Code": code, "Message": message},
+        "ResponseMetadata": {"HTTPStatusCode": 400, "RequestId": "synthetic-rerank-error"},
+    }, "Retrieve")
+
+    def retrieve(**request):
+        config = request["retrievalConfiguration"].get("vectorSearchConfiguration", {})
+        if "rerankingConfiguration" in config:
+            raise error
+        return {"retrievalResults": [copy.deepcopy(PASSAGE)]}
+
+    client = SimpleNamespace(retrieve=Mock(side_effect=retrieve))
+    control = SimpleNamespace(get_knowledge_base=Mock(return_value={
+        "knowledgeBase": {"knowledgeBaseConfiguration": {"type": "MANAGED"}},
+    }))
+    namespace = {
+        **cohere_preflight_fixture(),
+        "KB_ID": KB_ID, "QUERY": QUERY, "REGION": "us-east-1",
+        "KB_RUNTIME": client, "KB_CONTROL": control,
+        "os": SimpleNamespace(environ={
+            "RUN_RERANK": "1", "RUN_MANAGED_KB": "1", "MANAGED_KB_ID": MANAGED_ID,
+        }),
+        "print": Mock(),
+        # A previous successful cell must not leave a stale reranked result.
+        "reranked_hits": [PASSAGE], "rerank_status": "available",
+    }
+    return namespace, error
+
+
+def test_cohere_direct_preflight_consumes_body_and_checks_availability_before_kb_rerank(sdk_session):
+    namespace, _ = rerank_error_fixture("unused", "unused")
+    order = namespace["_cohere_order"]
+
+    def retrieve(**request):
+        if "rerankingConfiguration" in request["retrievalConfiguration"].get("vectorSearchConfiguration", {}):
+            order.append("kb-rerank")
+        return {"retrievalResults": [PASSAGE]}
+
+    namespace["KB_RUNTIME"].retrieve.side_effect = retrieve
+    execute("medium-12-e12b8aef", namespace)
+    request = namespace["RUNTIME"].invoke_model.call_args.kwargs
+    namespace["RUNTIME"].invoke_model.assert_called_once()
+    assert request["modelId"] == "cohere.rerank-v3-5:0"
+    assert request["contentType"] == request["accept"] == "application/json"
+    assert json.loads(request["body"]) == {
+        "api_version": 2, "query": QUERY,
+        "documents": ["Refurbished products include a 90-day warranty.",
+                      "Returns require original packaging."],
+        "top_n": 2,
+    }
+    client = sdk_session.client("bedrock-runtime")
+    control = sdk_session.client("bedrock")
+    try:
+        validate_parameters(request, client.meta.service_model.operation_model("InvokeModel").input_shape)
+        validate_parameters(
+            namespace["BEDROCK"].get_foundation_model_availability.call_args.kwargs,
+            control.meta.service_model.operation_model("GetFoundationModelAvailability").input_shape,
+        )
+    finally:
+        client.close()
+        control.close()
+    assert order == ["invoke", "availability", "kb-rerank"]
+    assert all(body.closed for body in namespace["_cohere_bodies"])
+    assert namespace["cohere_preflight"]["results"][0]["relevance_score"] == 0.98
+    assert namespace["rerank_status"] == "available"
+    assert any(call.args[0].get("cohere_preflight_scores") for call in namespace["print"].call_args_list
+               if call.args and isinstance(call.args[0], dict))
+
+
+@pytest.mark.parametrize("unready", [
+    {"agreementAvailability": {"status": "NOT_AVAILABLE"}},
+    {"authorizationStatus": "NOT_AUTHORIZED"},
+    {"entitlementAvailability": "NOT_AVAILABLE"},
+    {"regionAvailability": "NOT_AVAILABLE"},
+])
+def test_unready_cohere_does_not_claim_readiness_or_call_kb_rerank_but_managed_continues(unready):
+    namespace, _ = rerank_error_fixture("unused", "unused")
+    availability = {
+        "agreementAvailability": {"status": "AVAILABLE"}, "authorizationStatus": "AUTHORIZED",
+        "entitlementAvailability": "AVAILABLE", "regionAvailability": "AVAILABLE", **unready,
+    }
+    namespace.update(cohere_preflight_fixture(availability))
+    execute("medium-12-e12b8aef", namespace)
+    assert namespace["rerank_status"] == "activation_pending"
+    assert namespace["reranked_hits"] is None
+    assert namespace["retrieval_only_hits"] == [PASSAGE]
+    assert not any("rerankingConfiguration" in call.kwargs["retrievalConfiguration"].get(
+        "vectorSearchConfiguration", {}) for call in namespace["KB_RUNTIME"].retrieve.call_args_list)
+    namespace["KB_CONTROL"].get_knowledge_base.assert_called_once_with(knowledgeBaseId=MANAGED_ID)
+    assert any("rerun this cell" in str(call.args) for call in namespace["print"].call_args_list)
+
+
+def test_non_cohere_override_never_receives_cohere_payload_or_availability_probe():
+    namespace, _ = rerank_error_fixture("unused", "unused")
+    namespace["os"].environ["RERANK_MODEL_ARN"] = (
+        "arn:aws:bedrock:us-east-1::foundation-model/example.other-reranker:0"
+    )
+    namespace["KB_RUNTIME"].retrieve.side_effect = lambda **kwargs: {"retrievalResults": [PASSAGE]}
+    execute("medium-12-e12b8aef", namespace)
+    namespace["RUNTIME"].invoke_model.assert_not_called()
+    namespace["BEDROCK"].get_foundation_model_availability.assert_not_called()
+    assert namespace["rerank_status"] == "available"
+
+
+@pytest.mark.parametrize("failure", ["read", "invalid-json", "no-scores"])
+def test_cohere_body_is_closed_on_failure_without_claiming_ready(failure):
+    namespace, _ = rerank_error_fixture("unused", "unused")
+    if failure == "read":
+        body = Mock(read=Mock(side_effect=OSError("Synthetic read failure")))
+        expected = OSError
+    else:
+        body = io.BytesIO(b"not-json" if failure == "invalid-json" else b'{"results":[]}')
+        expected = json.JSONDecodeError if failure == "invalid-json" else RuntimeError
+    namespace["RUNTIME"].invoke_model.side_effect = None
+    namespace["RUNTIME"].invoke_model.return_value = {"body": body}
+    with pytest.raises(expected):
+        execute("medium-12-e12b8aef", namespace)
+    if failure == "read":
+        body.close.assert_called_once()
+    else:
+        assert body.closed
+    namespace["BEDROCK"].get_foundation_model_availability.assert_not_called()
+    assert namespace["rerank_status"] != "available"
+
+
+@pytest.mark.parametrize("code,message", [
+    ("ValidationException", "BedrockRuntime returned Status Code: 403; "
+     "not authorized for aws-marketplace:Subscribe and aws-marketplace:ViewSubscriptions."),
+    ("ValidationException", "BedrockRuntime AccessDeniedException: aws-marketplace:ViewSubscriptions required."),
+    ("ValidationException", "BedrockRuntime 403: AWS Marketplace Subscribe/ViewSubscriptions permissions missing."),
+    ("AccessDeniedException", "Missing permission aws-marketplace:Subscribe."),
+])
+def test_known_rerank_access_failure_preserves_control_error_and_continues_managed(code, message):
+    namespace, error = rerank_error_fixture(code, message)
+    execute("medium-12-e12b8aef", namespace)
+    assert namespace["rerank_status"] == "unavailable"
+    assert namespace["reranked_hits"] is None
+    assert namespace["rerank_error"] == error.response
+    assert namespace["retrieval_candidates"] == namespace["retrieval_only_hits"] == [PASSAGE]
+    calls = namespace["KB_RUNTIME"].retrieve.call_args_list
+    rerank_calls = [
+        call.kwargs for call in calls
+        if "rerankingConfiguration" in call.kwargs["retrievalConfiguration"].get("vectorSearchConfiguration", {})
+    ]
+    assert len(rerank_calls) == 1  # No fallback model/Region or retry.
+    assert rerank_calls[0]["retrievalConfiguration"]["vectorSearchConfiguration"][
+        "rerankingConfiguration"]["bedrockRerankingConfiguration"]["modelConfiguration"]["modelArn"] == (
+            "arn:aws:bedrock:us-east-1::foundation-model/cohere.rerank-v3-5:0"
+        )
+    assert calls[-1].kwargs == retrieval_request(MANAGED_ID, kind="managed")
+    namespace["KB_CONTROL"].get_knowledge_base.assert_called_once_with(knowledgeBaseId=MANAGED_ID)
+    reports = [call.args[0] for call in namespace["print"].call_args_list
+               if call.args and isinstance(call.args[0], dict)]
+    unavailable = next(row for row in reports if row.get("rerank_status") == "unavailable")
+    assert unavailable["raw_error"] == error.response
+    assert unavailable["error"] == str(error)
+    assert unavailable["rerank_model_arn"] == namespace["RERANK_MODEL_ARN"]
+    assert not any(row.get("variant") == "reranked" for row in reports)
+    assert any(row.get("variant") == "retrieval-only" and row["hits"] == [PASSAGE] for row in reports)
+
+
+@pytest.mark.parametrize("code,message", [
+    ("ValidationException", "Invalid metadata filter."),
+    ("ValidationException", "Reranking model is unsupported in this Region."),
+    ("ValidationException", "BedrockRuntime 403: model access denied."),
+    ("AccessDeniedException", "Not authorized to perform bedrock:Retrieve."),
+    ("ValidationException", "Invalid filter value aws-marketplace:Subscribe."),
+    ("ThrottlingException", "aws-marketplace:Subscribe returned 403."),
+])
+def test_other_rerank_errors_propagate_without_becoming_unavailable(code, message):
+    namespace, error = rerank_error_fixture(code, message)
+    with pytest.raises(ClientError) as raised:
+        execute("medium-12-e12b8aef", namespace)
+    assert raised.value is error
+    assert namespace["rerank_status"] != "unavailable"
+    assert namespace["reranked_hits"] is None
+    namespace["KB_CONTROL"].get_knowledge_base.assert_not_called()
+
+
+def test_workshop_filter_selects_warranty_from_actual_provisioned_documents():
+    import yaml
+
+    # Parse the fixture literal, never execute its provisioning handler.
+    template = yaml.load(
+        (ROOT / "03-developer-journey/prerequisite/infrastructure.yaml").read_text(),
+        Loader=yaml.BaseLoader,
+    )
+    code = template["Resources"]["KnowledgeBaseDocumentFunction"]["Properties"]["Code"]["ZipFile"]
+    assignment = next(
+        node for node in ast.parse(code).body
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "DATASETS" for target in node.targets
+        )
+    )
+    documents = ast.literal_eval(assignment.value)["playbook"]
+    assert len(documents) == 5
+    assert all(set(metadata) == {"doc_type", "product_line"} for _, metadata in documents.values())
+    namespace = {
+        "KB_ID": KB_ID, "QUERY": QUERY,
+        "KB_RUNTIME": SimpleNamespace(retrieve=Mock(return_value={"retrievalResults": []})),
+        "os": SimpleNamespace(environ={}), "print": Mock(),
+    }
+    execute("medium-12-e12b8aef", namespace)
+
+    def matches(metadata, rule):
+        if "andAll" in rule:
+            return all(matches(metadata, child) for child in rule["andAll"])
+        operation, condition = next(iter(rule.items()))
+        actual = metadata.get(condition["key"])
+        if operation == "equals":
+            return actual == condition["value"]
+        assert operation == "in"
+        return actual in condition["value"]
+
+    eligible = {
+        name: text for name, (text, metadata) in documents.items()
+        if matches(metadata, namespace["policy_filter"])
+    }
+    assert set(eligible) == {"returns-faq.txt", "warranty-faq.txt"}
+    assert "90-day warranty" in eligible["warranty-faq.txt"]
 
 
 def test_managed_type_check_stops_before_retrieval():
@@ -217,6 +503,31 @@ def test_real_strands_tool_loop_respects_retrieval_and_model_budgets(sdk_session
         assert printed[0]["stop_reason"] == "end_turn"
         assert "90 days" in printed[0]["answer"]
         assert printed[0]["agent_raw_usage"]["inputTokens"] == 200
+
+
+def test_managed_guardrail_request_explicitly_anonymizes_email_in_both_directions(sdk_session):
+    # Execute the authored call only: no readiness polling, model calls or cleanup.
+    tree = ast.parse(CELLS["medium-09-b459042d"])
+    creation = next(node for node in ast.walk(tree)
+                    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "create_guardrail")
+    control = SimpleNamespace(create_guardrail=Mock(return_value={"guardrailId": "synthetic"}))
+    eval(compile(ast.Expression(body=creation), str(NOTEBOOK), "eval"),
+         {"BEDROCK": control, "uuid": uuid})
+    control.create_guardrail.assert_called_once()
+    request = control.create_guardrail.call_args.kwargs
+    client = sdk_session.client("bedrock")
+    try:
+        validate_parameters(
+            request, client.meta.service_model.operation_model("CreateGuardrail").input_shape,
+        )
+    finally:
+        client.close()
+    email, = [entry for entry in request["sensitiveInformationPolicyConfig"]["piiEntitiesConfig"]
+              if entry["type"] == "EMAIL"]
+    assert email["action"] == "ANONYMIZE"
+    assert email["inputEnabled"] is True and email["outputEnabled"] is True
+    assert email["inputAction"] == email["outputAction"] == "ANONYMIZE"
 
 
 @pytest.mark.parametrize("fail_model", [False, True])
