@@ -32,6 +32,7 @@ notebook = [
     "tabulate>=0.9,<1",
     "openai==3.19.2",
     "anthropic[bedrock]==1.8.0",
+    "pip>=26,<27",
 ]
 langfuse = ["langfuse==4.15.4"]
 dev = [

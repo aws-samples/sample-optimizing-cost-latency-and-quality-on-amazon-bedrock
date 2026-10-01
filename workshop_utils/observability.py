@@ -14,7 +14,7 @@ import os
 import threading
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import closing, contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,6 +32,7 @@ _WRITE_METERS = tuple(f"cache_write_{ttl}_input_tokens" for ttl in ("5m", "1h", 
 _READ_METERS = ("cache_read_input_tokens", "cache_read_30m_input_tokens", "cache_read_unpriced_input_tokens")
 _LEGACY_WRITE_METERS = ("cache_creation_input_tokens", "cache_write_input_tokens")
 DEFAULT_NOTEBOOK_LOG_GROUP = "/aws/bedrock-agentcore/workshop/notebook-agents"
+_NOTEBOOK_LOG_STREAM = "runtime-logs"
 _lock = threading.Lock()
 _state = None
 _initialization_failed = False
@@ -478,6 +479,27 @@ class Observability:
             self.provider.shutdown()
 
 
+def _ensure_notebook_log_stream(region: str, log_group: str) -> None:
+    """Reuse the provisioned group and prepare ADOT's stream before export starts.
+
+    Existing streams need only DescribeLogStreams; creation needs CreateLogStream.
+    A missing group is a provisioning error, not permission to create a new group
+    with different retention/ownership. Only a concurrent stream creation is safe
+    to accept; all other AWS errors propagate to the caller.
+    """
+    boto3 = _dependency("boto3", "boto3")
+    with closing(boto3.client("logs", region_name=region)) as logs:
+        pages = logs.get_paginator("describe_log_streams").paginate(
+            logGroupName=log_group, logStreamNamePrefix=_NOTEBOOK_LOG_STREAM
+        )
+        for page in pages:
+            if any(stream["logStreamName"] == _NOTEBOOK_LOG_STREAM for stream in page.get("logStreams", [])):
+                return
+        # Another notebook kernel may have created this stream after our read.
+        with suppress(logs.exceptions.ResourceAlreadyExistsException):
+            logs.create_log_stream(logGroupName=log_group, logStreamName=_NOTEBOOK_LOG_STREAM)
+
+
 def setup_observability(
     backend: str = "agentcore",
     *,
@@ -495,8 +517,10 @@ def setup_observability(
 
     ``none`` imports no SDKs and installs no provider. Enabled modes capture local
     finished spans. AWS's X-Ray OTLP endpoint delivers traces to aws/spans;
-    log_group receives logs/metrics and must already exist. Transaction Search and
-    its X-Ray Logs resource policy must be enabled. Langfuse reads LANGFUSE_*
+    log_group receives logs/metrics and must already exist. Its runtime-logs stream
+    is checked/created before ADOT starts. Readiness errors leave setup retryable
+    and preserve the original AWS error. Transaction Search and its X-Ray Logs
+    resource policy must be enabled. Langfuse reads LANGFUSE_*
     configuration only when explicitly initialized. Generic OTLP endpoint/headers
     are rejected in AWS modes, never silently rewritten to a Langfuse endpoint.
 
@@ -553,6 +577,10 @@ def setup_observability(
             if os.environ.get("LANGFUSE_TRACING_ENABLED", "true").lower() == "false":
                 raise ValueError("LANGFUSE_TRACING_ENABLED=false conflicts with the selected backend")
 
+        if backend in {"agentcore", "both"}:
+            # Fail before changing the environment or initializing any providers.
+            _ensure_notebook_log_stream(region, log_group)
+
         try:
             if backend in {"agentcore", "both"}:
                 attributes = dict(
@@ -571,7 +599,7 @@ def setup_observability(
                         "OTEL_SERVICE_NAME": service_name,
                         "OTEL_RESOURCE_ATTRIBUTES": ",".join(f"{k}={v}" for k, v in attributes.items()),
                         "OTEL_EXPORTER_OTLP_LOGS_HEADERS": (
-                            f"x-aws-log-group={log_group},x-aws-log-stream=runtime-logs,"
+                            f"x-aws-log-group={log_group},x-aws-log-stream={_NOTEBOOK_LOG_STREAM},"
                             "x-aws-metric-namespace=bedrock-agentcore"
                         ),
                         "AWS_GENAI_CONTENT_EXTRACTION_OPT_OUT": "true",

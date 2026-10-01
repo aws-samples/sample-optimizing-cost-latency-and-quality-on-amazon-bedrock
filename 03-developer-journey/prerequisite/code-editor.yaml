@@ -1079,6 +1079,9 @@ Resources:
                   sudo -H -u ${CodeEditorUser} /usr/local/bin/uv pip install \
                     --python "$WORKSHOP_DIR/.venv/bin/python" --no-deps --editable .
                   sudo -H -u ${CodeEditorUser} /usr/local/bin/uv pip check --python "$WORKSHOP_DIR/.venv/bin/python"
+                  # The notebook teaches %pip; uv itself does not seed pip into the venv.
+                  # Verify the locked notebook dependency before advertising a ready kernel.
+                  sudo -H -u ${CodeEditorUser} "$WORKSHOP_DIR/.venv/bin/python" -m pip show boto3
                   sudo -H -u ${CodeEditorUser} "$WORKSHOP_DIR/.venv/bin/python" -m ipykernel install \
                     --user --name bedrock-workshop-py313 --display-name "Bedrock Workshop (Python 3.13)"
                   # A kernelspec env works independently of interactive .bashrc startup.

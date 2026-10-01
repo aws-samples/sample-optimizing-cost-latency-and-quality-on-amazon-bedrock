@@ -1,4 +1,4 @@
-"""No exporters or AWS clients are initialized by these tests."""
+"""Offline telemetry checks: exporters are faked and AWS clients are stubbed."""
 
 from __future__ import annotations
 
@@ -53,7 +53,12 @@ def telemetry(monkeypatch):
         events.append("langfuse")
         return Mock()
 
+    logs = Mock()
+    logs.get_paginator.return_value.paginate.return_value = [
+        {"logStreams": [{"logStreamName": "runtime-logs"}]}
+    ]
     modules = {
+        "boto3": SimpleNamespace(client=Mock(return_value=logs)),
         "opentelemetry.trace": trace,
         "opentelemetry.sdk.trace": trace_sdk,
         "opentelemetry.sdk.resources": resources,
@@ -113,6 +118,7 @@ assert state.collector.get_finished_spans() == ()
 def test_setup_idempotent_and_adot_before_langfuse(telemetry):
     state = obs.setup_observability("both", service_name="notebook")
     assert state is obs.setup_observability("both", service_name="notebook")
+    assert telemetry.modules["boto3"].client.call_count == 1
     assert telemetry.events == ["adot", "langfuse"]
     assert state.provider is telemetry.provider
     assert "OTEL_EXPORTER_OTLP_ENDPOINT" not in os.environ
@@ -219,10 +225,139 @@ def test_backend_modes(telemetry, backend):
     state = obs.setup_observability(backend)
     assert telemetry.events == {"agentcore": ["adot"], "langfuse": ["langfuse"], "none": []}[backend]
     assert state is obs.setup_observability(backend)
+    if backend in {"langfuse", "none"}:
+        telemetry.modules["boto3"].client.assert_not_called()
     if backend == "none":
         assert state.provider is None
         with pytest.raises(RuntimeError, match="restart"):
             obs.setup_observability("agentcore")
+
+
+@pytest.fixture
+def log_readiness(telemetry, monkeypatch):
+    import boto3
+    from botocore.stub import Stubber
+
+    # Explicit fixture credentials avoid the default credential chain/IMDS.
+    client = boto3.client(
+        "logs", region_name="eu-west-1",
+        aws_access_key_id="fixture", aws_secret_access_key="fixture",
+    )
+    monkeypatch.setattr(
+        client._endpoint.http_session, "send", Mock(side_effect=AssertionError("Unexpected live AWS call"))
+    )
+    close = Mock(wraps=client.close)
+    monkeypatch.setattr(client, "close", close)
+    factory = Mock(return_value=client)
+    telemetry.modules["boto3"] = SimpleNamespace(client=factory)
+    with Stubber(client) as stub:
+        yield SimpleNamespace(
+            stub=stub, client=client, close=close, factory=factory,
+            describe={"logGroupName": "/provisioned/notebook", "logStreamNamePrefix": "runtime-logs"},
+            create={"logGroupName": "/provisioned/notebook", "logStreamName": "runtime-logs"},
+        )
+        stub.assert_no_pending_responses()
+    client.close()
+
+
+@pytest.mark.parametrize("backend", ["agentcore", "both"])
+@pytest.mark.parametrize("stream_state", ["existing", "missing", "prefix_only", "paginated", "concurrent"])
+def test_log_stream_is_ready_before_adot_initializes(telemetry, log_readiness, backend, stream_state):
+    readiness = log_readiness
+    if stream_state == "paginated":
+        readiness.stub.add_response(
+            "describe_log_streams", {"logStreams": [], "nextToken": "page2"}, readiness.describe
+        )
+        readiness.stub.add_response(
+            "describe_log_streams", {"logStreams": [{"logStreamName": "runtime-logs"}]},
+            readiness.describe | {"nextToken": "page2"},
+        )
+    else:
+        names = {
+            "existing": ["runtime-logs"],
+            "missing": [],
+            "prefix_only": ["runtime-logs-old"],
+            "concurrent": [],
+        }[stream_state]
+        readiness.stub.add_response(
+            "describe_log_streams", {"logStreams": [{"logStreamName": name} for name in names]},
+            readiness.describe,
+        )
+    if stream_state in {"missing", "prefix_only"}:
+        readiness.stub.add_response("create_log_stream", {}, readiness.create)
+    elif stream_state == "concurrent":
+        readiness.stub.add_client_error(
+            "create_log_stream", "ResourceAlreadyExistsException", "Created by another kernel",
+            expected_params=readiness.create,
+        )
+    auto = telemetry.modules["opentelemetry.instrumentation.auto_instrumentation"]
+    initialize = auto.initialize
+
+    def initialize_after_readiness(**kwargs):
+        # Check at exporter startup, not just after setup has returned.
+        readiness.stub.assert_no_pending_responses()
+        readiness.close.assert_called_once()
+        assert os.environ["OTEL_EXPORTER_OTLP_LOGS_HEADERS"] == (
+            "x-aws-log-group=/provisioned/notebook,x-aws-log-stream=runtime-logs,"
+            "x-aws-metric-namespace=bedrock-agentcore"
+        )
+        initialize(**kwargs)
+
+    auto.initialize = initialize_after_readiness
+    state = obs.setup_observability(backend, region="eu-west-1", log_group="/provisioned/notebook")
+    assert state is obs.setup_observability(backend, region="eu-west-1", log_group="/provisioned/notebook")
+    readiness.factory.assert_called_once_with("logs", region_name="eu-west-1")
+    assert telemetry.events == (["adot", "langfuse"] if backend == "both" else ["adot"])
+    assert "OTEL_EXPORTER_OTLP_TRACES_HEADERS" not in os.environ
+
+
+@pytest.mark.parametrize("operation", ["describe_log_streams", "create_log_stream"])
+@pytest.mark.parametrize("code", [
+    "AccessDeniedException", "ResourceNotFoundException", "ServiceUnavailableException", "ThrottlingException",
+])
+def test_log_readiness_errors_are_preserved_before_any_initialization(telemetry, log_readiness, operation, code):
+    from botocore.exceptions import ClientError
+
+    readiness = log_readiness
+    if operation == "create_log_stream":
+        readiness.stub.add_response("describe_log_streams", {"logStreams": []}, readiness.describe)
+    readiness.stub.add_client_error(
+        operation, code, "Original AWS error", response_meta={"RequestId": "request-fixture"},
+        expected_params=readiness.describe if operation == "describe_log_streams" else readiness.create,
+    )
+    environment = dict(os.environ)
+    with pytest.raises(ClientError) as error:
+        obs.setup_observability("both", region="eu-west-1", log_group="/provisioned/notebook")
+    assert error.value.response["Error"] == {"Code": code, "Message": "Original AWS error"}
+    assert error.value.response["ResponseMetadata"]["RequestId"] == "request-fixture"
+    assert error.value.operation_name == (
+        "DescribeLogStreams" if operation == "describe_log_streams" else "CreateLogStream"
+    )
+    assert telemetry.events == []
+    assert os.environ == environment
+    assert obs._state is None
+    assert not obs._initialization_failed
+    readiness.close.assert_called_once()
+
+    # Readiness is retryable after the provisioning/access problem is corrected.
+    readiness.stub.add_response(
+        "describe_log_streams", {"logStreams": [{"logStreamName": "runtime-logs"}]}, readiness.describe
+    )
+    assert obs.setup_observability("both", region="eu-west-1", log_group="/provisioned/notebook").provider
+    assert telemetry.events == ["adot", "langfuse"]
+
+
+def test_log_readiness_transport_error_is_not_reported_as_success(telemetry, log_readiness, monkeypatch):
+    from botocore.exceptions import EndpointConnectionError
+
+    failure = EndpointConnectionError(endpoint_url="https://logs.eu-west-1.amazonaws.com")
+    monkeypatch.setattr(log_readiness.client, "describe_log_streams", Mock(side_effect=failure))
+    with pytest.raises(EndpointConnectionError) as error:
+        obs.setup_observability("agentcore", region="eu-west-1", log_group="/provisioned/notebook")
+    assert error.value is failure
+    assert telemetry.events == []
+    assert obs._state is None
+    assert not obs._initialization_failed
 
 
 @pytest.mark.parametrize("setting", ["OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_HEADERS"])
