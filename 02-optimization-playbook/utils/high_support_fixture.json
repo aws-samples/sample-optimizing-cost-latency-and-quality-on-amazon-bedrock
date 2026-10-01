@@ -1,5 +1,5 @@
 {
-  "source": "03-developer-journey/agents/gateway_lambda.py; schemas from utils/tools.py via gateway_setup.tool_schema (read-only subset)",
+  "source": "03-developer-journey/prerequisite/infrastructure.yaml: LambdaCodeSetupFunction generates support_info.py; read-only tool schemas are listed below. Function hashes use SHA-256 of ast.unparse(function).",
   "function_sha256": {
     "get_return_policy": "7d395df8b615ae92d57381360199a60b4c0d63733646347744acbc758ac2ed03",
     "get_product_info": "0b70395cd0ea340d6d8814773e67a72d2fc5aa8b45b29b3693576eafd710f403"

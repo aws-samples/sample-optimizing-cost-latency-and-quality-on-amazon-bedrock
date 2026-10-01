@@ -219,7 +219,7 @@ def test_held_out_comparison_uses_full_template_and_same_actual_settings(lab):
     ns = lab.ns
     ns["apo_candidate_template"] = "Classify {{ticket}}."
     ns["APO_MODEL_CONFIGS"][0]["inferenceConfig"]["maxTokens"] = 512
-    ns["APO_MODEL_CONFIGS"][0]["additionalModelRequestFields"]["output_config"]["effort"] = "medium"
+    ns["APO_MODEL_CONFIGS"][0]["additionalModelRequestFields"] = {"output_config": {"effort": "medium"}}
     ns["apo_comparison_config"] = copy.deepcopy(ns["APO_MODEL_CONFIGS"][0])
     ns["apo_comparison_baseline"] = ns["APO_BASELINE_TEMPLATE"]
     ns["APO_JOB_ARN"] = ns["apo_candidate_job_arn"] = JOB
