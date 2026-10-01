@@ -7,7 +7,6 @@ import copy
 import json
 import time
 from collections.abc import Mapping
-from datetime import timedelta
 from pathlib import Path
 
 from jsonschema import ValidationError, validate
@@ -122,7 +121,7 @@ async def execute_read_only(session, proposed: dict, definitions: list[dict], ta
         try:
             result = await asyncio.wait_for(
                 session.call_tool(proposed["name"], arguments=proposed["input"],
-                                  read_timeout_seconds=timedelta(seconds=timeout_seconds)),
+                                  read_timeout_seconds=timeout_seconds),
                 timeout=timeout_seconds,
             )
             payload = result.model_dump(by_alias=True, exclude_none=True)
@@ -215,7 +214,7 @@ async def discover_read_only(session, query: str, full: list[dict], *, timeout_s
     try:
         result = await asyncio.wait_for(
             session.call_tool(SEARCH_TOOL, arguments={"query": query},
-                              read_timeout_seconds=timedelta(seconds=timeout_seconds)),
+                              read_timeout_seconds=timeout_seconds),
             timeout=timeout_seconds,
         )
         payload = result.model_dump(by_alias=True, exclude_none=True)
