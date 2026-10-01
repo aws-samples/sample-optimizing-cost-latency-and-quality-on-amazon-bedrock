@@ -188,6 +188,49 @@ def test_strands_without_uniform_ttl_is_marked_unpriced():
     assert "langfuse.observation.cost_details" not in output
 
 
+@pytest.mark.parametrize("kind", ["converse", "strands", "sdk"])
+@pytest.mark.parametrize("level", [None, "ERROR"])
+def test_unpriced_cache_has_visible_warning_without_changing_usage_or_native_span(kind, level):
+    counts = {"input": 7, "output": 11, "cache_read_unpriced_input_tokens": 17,
+              "cache_write_unpriced_input_tokens": 42}
+    if kind == "converse":
+        scope = CONVERSE_SCOPE
+        attrs = {"workshop.model_call": True, "gen_ai.request.model": GPT,
+                 "workshop.normalized_usage": json.dumps(NormalizedUsage(7, 11, 17, 42).as_dict())}
+    elif kind == "strands":
+        scope = "strands.telemetry.tracer"
+        attrs = {**strands_attributes(), "gen_ai.request.model": GPT}
+    else:
+        scope = "langfuse-sdk"
+        attrs = {USAGE: json.dumps(counts), "langfuse.observation.model.name": GPT}
+    attrs["langfuse.observation.status_message"] = "Earlier diagnostic."
+    if level:
+        attrs["langfuse.observation.level"] = level
+    original = dict(attrs)
+    identifier, span = batch_span(attrs, scope=scope)
+    output = apply_patch(span, patch_batch((identifier, span))[identifier])
+    assert output[STATUS] == "unpriced_cache"
+    assert output["langfuse.observation.level"] == (level or "WARNING")
+    assert output["langfuse.observation.status_message"] == (
+        "Earlier diagnostic. Incomplete cost estimate: some cache tokens have no verified price."
+    )
+    assert json.loads(output[USAGE]) == counts
+    assert "langfuse.observation.cost_details" not in output
+    assert attrs == original and span.attributes == original
+    again_id, again = batch_span(output, scope=scope)
+    again_output = apply_patch(again, patch_batch((again_id, again))[again_id])
+    assert again_output["langfuse.observation.status_message"] == output["langfuse.observation.status_message"]
+
+
+def test_fully_priced_cache_does_not_gain_an_incomplete_cost_warning():
+    attrs = strands_attributes()
+    identifier, span = batch_span(attrs)
+    output = apply_patch(span, patch_batch((identifier, span))[identifier])
+    assert output[STATUS] == "canonical"
+    assert "langfuse.observation.level" not in output
+    assert "langfuse.observation.status_message" not in output
+
+
 @pytest.mark.parametrize(
     "scope,operation,status",
     [

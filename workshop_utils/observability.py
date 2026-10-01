@@ -123,12 +123,22 @@ def _usage_attributes(attributes: Mapping) -> tuple[str, ...]:
     )
 
 
-def _unpriced_attributes(details: Mapping) -> dict:
+def _unpriced_attributes(details: Mapping, attributes: Mapping) -> dict:
     unpriced = [key for key, value in details.items() if "_unpriced_" in key and value]
-    return {
+    result = {
         _USAGE_STATUS: "unpriced_cache" if unpriced else "canonical",
         "langfuse.observation.metadata.unpriced_meters": json.dumps(unpriced),
     }
+    if unpriced:
+        warning = "Incomplete cost estimate: some cache tokens have no verified price."
+        previous = attributes.get("langfuse.observation.status_message")
+        result["langfuse.observation.status_message"] = (
+            previous if isinstance(previous, str) and warning in previous
+            else f"{previous} {warning}" if previous else warning
+        )
+        if attributes.get("langfuse.observation.level") != "ERROR":
+            result["langfuse.observation.level"] = "WARNING"
+    return result
 
 
 def _normalize_sdk_usage(details: dict, attributes: Mapping) -> dict | None:
@@ -238,7 +248,7 @@ def normalize_langfuse_spans(*, params: Any) -> Any:
                         "langfuse.observation.metadata.unpriced_meters": json.dumps(list(details)),
                     }
                 else:
-                    export_attributes = _unpriced_attributes(normalized)
+                    export_attributes = _unpriced_attributes(normalized, attributes)
                     if normalized != details:
                         export_attributes[_USAGE_DETAILS] = json.dumps(normalized)
                 patches[identifier] = OtelSpanPatch(
@@ -270,7 +280,7 @@ def normalize_langfuse_spans(*, params: Any) -> Any:
                     _USAGE_DETAILS: json.dumps(details),
                     "langfuse.observation.type": "generation",
                     "langfuse.observation.model.name": attributes.get("gen_ai.request.model", ""),
-                    **_unpriced_attributes(details),
+                    **_unpriced_attributes(details, attributes),
                 },
             )
         except Exception:
