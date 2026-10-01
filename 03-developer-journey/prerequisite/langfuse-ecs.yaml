@@ -448,7 +448,7 @@ Resources:
                               exit 1
                               ;;
                           esac
-                        elif grep -Fxq 'An error occurred (ValidationError) when calling the DescribeStacks operation: Stack with id CDKToolkit does not exist' "$BOOTSTRAP_ERROR"; then
+                        elif grep -Eq '^(aws: \[ERROR\]: )?An error occurred \(ValidationError\) when calling the DescribeStacks operation: Stack with id CDKToolkit does not exist[[:space:]]*$' "$BOOTSTRAP_ERROR"; then
                           echo "CDKToolkit does not exist; initializing CDK bootstrap"
                           npx cdk bootstrap
                         else
