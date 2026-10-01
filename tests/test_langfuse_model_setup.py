@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ast
 import copy
 import importlib.util
+import itertools
 import json
 import re
 import subprocess
@@ -20,17 +22,38 @@ spec = importlib.util.spec_from_file_location("langfuse_model_setup", SCRIPT)
 setup = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(setup)
 BASE = "https://langfuse.example.test"
+COMPARISON_MODEL = "global.anthropic.claude-sonnet-4-6"
 CLAUDE_IDS = [
     "global.anthropic.claude-sonnet-5",
     "global.anthropic.claude-haiku-4-5-20251001-v1:0",
     "global.anthropic.claude-opus-5",
+    COMPARISON_MODEL,
 ]
 GPT_IDS = ["global.openai.gpt-5.6-luna", "global.openai.gpt-5.6-sol"]
+DEFAULT_IDS = CLAUDE_IDS[:3] + GPT_IDS + [COMPARISON_MODEL]
 UNPRICED_KEYS = {"cache_read_unpriced_input_tokens", "cache_write_unpriced_input_tokens"}
 LEGACY_KEYS = {
     "total", "total_tokens", "total_input_tokens", "input_tokens", "output_tokens",
     "cache_creation_input_tokens", "cache_creation.input_tokens", "cache_read.input_tokens",
     "cache_write_input_tokens", "cacheReadInputTokens", "cacheWriteInputTokens",
+}
+VALIDATION_BODY = {
+    "message": "Invalid request data",
+    "error": [
+        {
+            "path": ["pricingTiers", 1, "conditions", 0, "usageDetailPattern"],
+            "code": "too_big", "maximum": 200,
+            "message": "Pattern exceeds maximum length of 200 characters",
+        },
+        {
+            "path": ["pricingTiers", 1, "conditions", 0, "usageDetailPattern"],
+            "code": "custom", "message": "Invalid regex pattern: safe backtracking required",
+        },
+        {
+            "path": [], "code": "custom",
+            "message": "Must provide either flat prices (inputPrice, outputPrice, totalPrice) OR pricingTiers",
+        },
+    ],
 }
 
 
@@ -70,6 +93,8 @@ class ModelServer:
         self.calls = []
         self.fail_after_write = False
         self.reject_write = False
+        self.rejection_status = 400
+        self.rejection_body = {"message": "invalid model", "error": "InvalidRequestError"}
         self.corrupt_read = False
 
     def handle(self, request):
@@ -84,8 +109,12 @@ class ModelServer:
             })
         if request.method == "POST" and request.url.path == "/api/public/models":
             if self.reject_write:
-                return httpx.Response(400, json={"message": "invalid model", "error": "InvalidRequestError"})
+                return httpx.Response(self.rejection_status, json=self.rejection_body)
             body = json.loads(request.content)
+            # SDK 4.15.4 accepts longer strings, but server 3.153.0 rejects them.
+            for tier in body["pricingTiers"]:
+                for condition in tier["conditions"]:
+                    assert len(condition["usageDetailPattern"]) <= 200
             assert not any(m["modelName"] == body["modelName"] for m in self.models if not m["isLangfuseManaged"])
             model = model_response(body, f"model-{len(self.models) + 1}")
             self.models.append(model)
@@ -109,11 +138,15 @@ class ModelServer:
         return [call for call in self.calls if call[0] != "GET"]
 
 
-def test_defaults_are_all_five_exact_global_profiles_with_all_registry_cache_prices():
+def definitions_for(model_ids):
+    return [body for body in setup.build_definitions() if body["modelName"] in model_ids]
+
+
+def test_defaults_are_all_six_exact_global_profiles_with_all_registry_cache_prices():
     from workshop_utils.pricing import get_price
 
     definitions = setup.build_definitions()
-    assert [body["modelName"] for body in definitions] == CLAUDE_IDS + GPT_IDS
+    assert [body["modelName"] for body in definitions] == DEFAULT_IDS
     for body in definitions:
         model_id = body["modelName"]
         pattern = body["matchPattern"]
@@ -135,6 +168,66 @@ def test_defaults_are_all_five_exact_global_profiles_with_all_registry_cache_pri
         assert not ({"inputPrice", "outputPrice", "totalPrice", "prices"} & set(body))
 
 
+@pytest.mark.parametrize("filename,setting", [
+    ("03-high-effort.ipynb", "OPTIMIZE_INFERENCE_MODEL"),
+    ("02-medium-effort.ipynb", "CONTEXT_MODEL"),
+])
+def test_defaults_cover_explicit_comparison_models(filename, setting):
+    notebook = json.loads((ROOT / "02-optimization-playbook" / filename).read_text())
+    assignments = []
+    for cell in notebook["cells"]:
+        source = "".join(cell["source"])
+        if cell["cell_type"] != "code" or setting not in source:
+            continue
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == setting
+                for target in node.targets
+            ):
+                assignments.append(ast.literal_eval(node.value))
+    (model_id,) = assignments
+    assert model_id in {body["modelName"] for body in setup.build_definitions()}
+
+
+def test_long_context_pattern_matches_only_the_eight_canonical_input_meters():
+    canonical = {
+        "input", "cache_read_input_tokens", "cache_write_5m_input_tokens", "cache_write_1h_input_tokens",
+        "cache_read_30m_input_tokens", "cache_write_30m_input_tokens",
+        "cache_read_unpriced_input_tokens", "cache_write_unpriced_input_tokens",
+    }
+    negative = LEGACY_KEYS | {"output", "INPUT", "unrelated", "other_input_tokens"}
+    for operation, ttl, suffix in itertools.product(
+        ("read", "write", "creation"), ("", "_5m", "_1h", "_30m", "_unpriced", "_unknown"),
+        ("_input_tokens", "_output_tokens", ".input_tokens", "_tokens"),
+    ):
+        negative.add(f"cache_{operation}{ttl}{suffix}")
+    negative -= canonical
+    negative |= {f"prefix{key}" for key in canonical} | {f"{key}_extra" for key in canonical}
+    assert set(setup.INPUT_USAGE_KEYS) == canonical
+    for body in definitions_for(GPT_IDS):
+        pattern = body["pricingTiers"][1]["conditions"][0]["usageDetailPattern"]
+        assert pattern.startswith("^") and pattern.endswith("$")
+        assert len(pattern) <= 200
+        # Finite alternation has no repeats/wildcards that can backtrack unsafely.
+        assert not any(character in pattern for character in "*+?{.")
+        assert all(re.search(pattern, key) for key in canonical)
+        assert all(re.search(pattern, key) is None for key in negative)
+
+
+@pytest.mark.parametrize("length", [200, 201, 213])
+def test_server_usage_pattern_limit_is_checked_before_listing_or_creating(length):
+    definitions = setup.build_definitions()
+    gpt = next(body for body in definitions if body["modelName"] == GPT_IDS[-1])
+    gpt["pricingTiers"][1]["conditions"][0]["usageDetailPattern"] = "^" + "a" * (length - 2) + "$"
+    server = ModelServer()
+    if length <= 200:
+        assert len(server.run(definitions)) == 6
+    else:
+        with pytest.raises(setup.ModelSetupError, match=r"pricingTiers\[1\].conditions\[0\].usageDetailPattern.*200"):
+            server.run(definitions)
+        assert server.calls == []
+
+
 @pytest.mark.parametrize("writes", [{"5m": 700}, {"1h": 900}, {"5m": 700, "1h": 900}])
 def test_claude_5m_1h_and_mixed_writes_match_per_request_calculator(writes):
     from workshop_utils.bedrock import NormalizedUsage
@@ -145,7 +238,7 @@ def test_claude_5m_1h_and_mixed_writes_match_per_request_calculator(writes):
         "input": 120, "output": 40, "cache_read_input_tokens": 300,
         **{f"cache_write_{ttl}_input_tokens": count for ttl, count in writes.items()},
     }
-    for body in setup.build_definitions()[:3]:
+    for body in definitions_for(CLAUDE_IDS):
         cost, tier = request_cost(body, canonical)
         assert tier["isDefault"]
         assert cost == pytest.approx(calculate_cost(body["modelName"], usage).total_cost)
@@ -171,7 +264,7 @@ def test_exact_registry_records_and_sources_flow_into_payload_without_fallback(m
 
     monkeypatch.setattr(pricing, "get_price", get_price)
     definitions = setup.build_definitions()
-    assert [model_id for model_id, _ in fetched] == CLAUDE_IDS + GPT_IDS
+    assert [model_id for model_id, _ in fetched] == DEFAULT_IDS
     for body, (model_id, record) in zip(definitions, fetched, strict=True):
         assert record.sources == original(model_id).sources
         assert record.sources and record.evidence in {"documented", "price-list"} and not record.inferred
@@ -213,7 +306,11 @@ def test_unpriced_cache_alias_and_duplicate_aliases_preserve_registry_rules(monk
         setup.build_definitions()
     aliases["workhorse"] = aliases["small"]
     names = [body["modelName"] for body in setup.build_definitions()]
-    assert len(names) == len(set(names)) == 4
+    assert len(names) == len(set(names)) == 5
+    aliases["workhorse"] = COMPARISON_MODEL
+    names = [body["modelName"] for body in setup.build_definitions()]
+    assert len(names) == len(set(names)) == 5
+    assert names.count(COMPARISON_MODEL) == 1
 
 
 @pytest.mark.parametrize("change", [
@@ -237,7 +334,7 @@ def test_gpt_30m_and_long_context_prices_match_per_request_calculator(count, rea
     from workshop_utils.bedrock import NormalizedUsage
     from workshop_utils.pricing import calculate_cost
 
-    for body in setup.build_definitions()[3:]:
+    for body in definitions_for(GPT_IDS):
         standard, long = body["pricingTiers"]
         condition = long["conditions"][0]
         assert condition["operator"] == "gt" and condition["value"] == 272000
@@ -257,7 +354,7 @@ def test_gpt_30m_and_long_context_prices_match_per_request_calculator(count, rea
 
 @pytest.mark.parametrize("key", setup.INPUT_USAGE_KEYS)
 def test_gpt_context_condition_counts_every_disjoint_input_including_unpriced(key):
-    for body in setup.build_definitions()[3:]:
+    for body in definitions_for(GPT_IDS):
         usage = {"input": 272000, "output": 10}
         standard_cost, _ = request_cost(body, usage)
         usage[key] = usage.get(key, 0) + 1
@@ -308,7 +405,7 @@ def test_gpt_converse_cache_counts_remain_unpriced_but_select_long_context():
     from workshop_utils.observability import langfuse_usage_details
 
     usage = NormalizedUsage(272000, 40, 300, 700, {"30m": 700})
-    for body in setup.build_definitions()[3:]:
+    for body in definitions_for(GPT_IDS):
         canonical = langfuse_usage_details(usage, model_id=body["modelName"], api="converse")
         assert canonical == {
             "input": 272000, "output": 40,
@@ -360,7 +457,7 @@ def test_public_sdk_payload_validation_roundtrip_pagination_and_idempotent_rerun
     first = server.run(definitions)
     before = copy.deepcopy(server.models)
     second = server.run(definitions)
-    assert len(server.writes) == 5 and server.models == before
+    assert len(server.writes) == 6 and server.models == before
     assert [row["id"] for row in first] == [row["id"] for row in second]
     assert {row["status"] for row in first} == {"created"}
     assert {row["status"] for row in second} == {"reused"}
@@ -373,7 +470,8 @@ def test_invalid_public_sdk_body_fails_before_any_api_call():
     from pydantic import ValidationError
 
     definitions = setup.build_definitions()
-    definitions[-1]["pricingTiers"][1]["conditions"][0]["operator"] = "unsupported"
+    gpt = next(body for body in definitions if body["modelName"] == GPT_IDS[-1])
+    gpt["pricingTiers"][1]["conditions"][0]["operator"] = "unsupported"
     server = ModelServer()
     with pytest.raises(ValidationError):
         server.run(definitions)
@@ -383,7 +481,7 @@ def test_invalid_public_sdk_body_fails_before_any_api_call():
 @pytest.mark.parametrize("difference", ["price", "pattern", "tokenizer", "date", "tier", "usage"])
 def test_any_conflicting_behavior_stops_entire_plan_before_first_create(difference):
     definitions = setup.build_definitions()
-    model = model_response(definitions[-1])
+    model = model_response(next(body for body in definitions if body["modelName"] == GPT_IDS[-1]))
     if difference == "price":
         model["pricingTiers"][0]["prices"]["input"] *= 2
     elif difference == "pattern":
@@ -441,7 +539,7 @@ def test_managed_and_unrelated_records_are_preserved():
     ]
     server = ModelServer(existing)
     server.run(definitions)
-    assert len(server.writes) == 5 and server.models[:2] == existing
+    assert len(server.writes) == 6 and server.models[:2] == existing
 
 
 def test_timeout_after_committed_create_is_not_retried_and_rerun_reconciles():
@@ -458,8 +556,64 @@ def test_timeout_after_committed_create_is_not_retried_and_rerun_reconciles():
 def test_rejected_create_is_not_retried():
     server = ModelServer()
     server.reject_write = True
-    with pytest.raises(setup.ModelSetupError, match="No automatic retry"):
+    with pytest.raises(setup.ModelSetupError, match="No automatic retry") as error:
         server.run(setup.build_definitions())
+    assert "Create rejected" in str(error.value)
+    assert "HTTP 400; invalid model" in str(error.value)
+    assert len(server.writes) == 1
+
+
+def test_validation_diagnostics_and_rerun_preserve_the_three_existing_claude_definitions():
+    definitions = setup.build_definitions()
+    existing = [model_response(body, model_id=f"claude-{index}") for index, body in enumerate(definitions[:3])]
+    server = ModelServer(existing)
+    server.reject_write = True
+    server.rejection_body = VALIDATION_BODY
+    with pytest.raises(setup.ModelSetupError) as error:
+        server.run(definitions)
+    diagnostic = str(error.value)
+    assert "Create rejected for global.openai.gpt-5.6-luna" in diagnostic
+    assert "HTTP 400; Invalid request data" in diagnostic
+    assert "request.pricingTiers[1].conditions[0].usageDetailPattern" in diagnostic
+    for issue in VALIDATION_BODY["error"]:
+        assert issue["message"] in diagnostic
+    assert "No automatic retry" in diagnostic and "reconcile" in diagnostic
+    assert len(server.writes) == 1 and server.models == existing
+
+    server.reject_write = False
+    result = server.run(definitions)
+    assert [row["status"] for row in result] == ["reused"] * 3 + ["created"] * 3
+    assert server.models[:3] == existing
+    assert len(server.writes) == 4  # One rejected request, then the three missing models.
+    assert [row["status"] for row in server.run(definitions)] == ["reused"] * 6
+    assert len(server.writes) == 4
+
+
+def test_adding_comparison_model_reuses_all_five_primary_definitions_without_changes(monkeypatch):
+    with monkeypatch.context() as patch:
+        patch.setattr(setup, "COMPARISON_MODEL_IDS", ())
+        primary_definitions = setup.build_definitions()
+    definitions = setup.build_definitions()
+    assert len(primary_definitions) == 5 and definitions[:5] == primary_definitions
+    existing = [model_response(body, model_id=f"primary-{index}") for index, body in enumerate(primary_definitions)]
+    server = ModelServer(existing)
+    result = server.run(definitions)
+    assert [row["status"] for row in result] == ["reused"] * 5 + ["created"]
+    assert result[-1]["model"] == COMPARISON_MODEL
+    assert server.models[:5] == existing and len(server.writes) == 1
+    assert [row["status"] for row in server.run(definitions)] == ["reused"] * 6
+    assert server.models[:5] == existing and len(server.writes) == 1
+
+
+def test_server_failure_remains_uncertain_without_body_dump_or_automatic_retry():
+    server = ModelServer()
+    server.reject_write = True
+    server.rejection_status = 500
+    server.rejection_body = {"message": "private server debug data"}
+    with pytest.raises(setup.ModelSetupError, match="outcome uncertain") as error:
+        server.run(setup.build_definitions())
+    assert "private server debug data" not in str(error.value)
+    assert "No automatic retry" in str(error.value)
     assert len(server.writes) == 1
 
 
@@ -483,7 +637,7 @@ with patch.object(socket.socket, "connect", side_effect=AssertionError("offline"
 """, str(SCRIPT),
     ], cwd=tmp_path, text=True, capture_output=True, timeout=30, check=False)
     assert result.returncode == 0, result.stderr
-    assert len(json.loads(result.stdout)) == 5
+    assert len(json.loads(result.stdout)) == 6
     assert result.stderr == ""
 
 
@@ -499,11 +653,11 @@ def test_cli_defaults_report_only_created_and_reused_counts(monkeypatch, capsys)
     monkeypatch.setattr(httpx, "Client", lambda **kwargs: original(transport=httpx.MockTransport(server.handle), **kwargs))
     assert setup.main([]) == 0
     out = capsys.readouterr()
-    assert out.out == "Models: 5 created, 0 reused.\n" and out.err == ""
+    assert out.out == "Models: 6 created, 0 reused.\n" and out.err == ""
     assert setup.main([]) == 0
     out = capsys.readouterr()
-    assert out.out == "Models: 0 created, 5 reused.\n" and out.err == ""
-    assert len(server.writes) == 5
+    assert out.out == "Models: 0 created, 6 reused.\n" and out.err == ""
+    assert len(server.writes) == 6
 
 
 def test_cli_help_has_no_participant_pricing_decisions(capsys):
@@ -534,3 +688,60 @@ def test_cli_sanitizes_server_errors_and_does_not_follow_redirects(monkeypatch, 
     out = capsys.readouterr()
     assert "sk-private-test" not in out.err + out.out
     assert len(requests) == 1 and requests[0].url.host == "langfuse.example.test"
+
+
+def test_cli_validation_paths_and_messages_exclude_credentials_headers_and_request_echo(monkeypatch, capsys):
+    import base64
+
+    import dotenv
+
+    monkeypatch.setattr(dotenv, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setenv("LANGFUSE_BASE_URL", BASE)
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-private-test")
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "opaque-private-secret")
+    authorization = "Basic " + base64.b64encode(b"pk-private-test:opaque-private-secret").decode()
+    body = copy.deepcopy(VALIDATION_BODY)
+    body.update({
+        "headers": {"Authorization": authorization},
+        "request": {"secret": "request-echo-must-not-appear"},
+        "debug": "debug-must-not-appear",
+    })
+    body["error"][0]["message"] += (
+        f"; key pk-private-test opaque-private-secret sk-lf-other-secret; {authorization}"
+    )
+    body["error"][0]["input"] = "input-echo-must-not-appear"
+    calls = []
+    original = httpx.Client
+
+    def handle(request):
+        calls.append((request.method, request.url.path))
+        if request.method == "GET":
+            return httpx.Response(200, json={
+                "data": [], "meta": {"page": 1, "limit": 100, "totalPages": 0, "totalItems": 0},
+            })
+        return httpx.Response(400, json=body, headers={"X-Private": "response-header-must-not-appear"})
+
+    monkeypatch.setattr(httpx, "Client", lambda **kwargs: original(transport=httpx.MockTransport(handle), **kwargs))
+    assert setup.main([]) == 1
+    out = capsys.readouterr()
+    assert out.out == ""
+    assert "HTTP 400; Invalid request data" in out.err
+    assert "pricingTiers[1].conditions[0].usageDetailPattern" in out.err
+    assert "Pattern exceeds maximum length of 200 characters" in out.err
+    for sensitive in (
+        "pk-private-test", "opaque-private-secret", "sk-lf-other-secret", authorization,
+        "request-echo-must-not-appear", "debug-must-not-appear",
+        "input-echo-must-not-appear", "response-header-must-not-appear",
+    ):
+        assert sensitive not in out.err
+    assert [method for method, _ in calls] == ["GET", "POST"]
+
+
+@pytest.mark.parametrize("body", [
+    "opaque server response", {"error": "InvalidRequestError"},
+    {"error": [None, {"path": {}, "message": {"private": "payload"}}]},
+])
+def test_unstructured_400_does_not_dump_arbitrary_body(body):
+    from langfuse.api.commons.errors.error import Error
+
+    assert setup._validation_diagnostics(Error(body, headers={"Authorization": "private"})) == "HTTP 400"

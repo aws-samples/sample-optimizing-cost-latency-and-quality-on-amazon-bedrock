@@ -167,6 +167,52 @@ def test_representative_cells_preserve_call_counts_and_show_sent_fields(lab):
         assert all(any(request.get(field) == value for request in lab.calls) for value in displays)
 
 
+def test_email_contract_preserves_raw_failures_and_checks_every_required_detail(lab):
+    execute("low-05-9ee8d1ad", lab.ns)
+    check = lab.ns["email_extraction_checks"]
+    correct = {
+        "issue": ["cracked case", "left earbud won't charge"], "sentiment": "negative",
+        "action": "replacement", "deadline": "before the weekend",
+    }
+    assert all(check(json.dumps(correct), "end_turn").values())
+    assert not all(check(json.dumps(correct), "max_tokens").values())
+    for field, wrong in [
+        ("issue", ["cracked case"]), ("issue", ["left earbud won't charge"]),
+        ("issue", "defective product"), ("sentiment", "positive"),
+        ("action", "refund"), ("deadline", None), ("deadline", "next month"),
+        ("extra", "unsupported"),
+    ]:
+        assert not all(check(json.dumps({**correct, field: wrong}), "end_turn").values())
+    compressed = '{"issue":"defective product","sentiment":"negative","action":"replace"}'
+    for invalid in [compressed, "```json\n" + json.dumps(correct) + "\n```", "[]", "null", "billing"]:
+        assert not all(check(invalid, "end_turn").values())
+    # The model stub returned failures: no correction, stripping, or hidden retry.
+    assert len(lab.calls) == len(lab.ns["prompt_design_rows"]) == 2
+    assert all(not result["passed"] and result["row"]["text"] == "billing"
+               for result in lab.ns["prompt_design_rows"])
+    assert all(request["modelId"] == lab.ns["SMALL"] for request in lab.calls)
+    assert all("outputConfig" not in request for request in lab.calls)  # This comparison teaches prompting.
+    assert "all defect phrases, verbatim" in lab.ns["STRUCTURED_PROMPT"]
+    assert "deadline (requested timing, verbatim)" in lab.ns["STRUCTURED_PROMPT"]
+
+
+def test_self_refine_requests_only_customer_reply_and_keeps_three_call_measurement(lab):
+    lab.ns["os"] = SimpleNamespace(environ={"RUN_SELF_REFINE": "1"})
+    execute("low-18-d729885a", lab.ns)
+    assert len(lab.calls) == 3
+    draft, critique, revision = [
+        request["messages"][0]["content"][0]["text"] for request in lab.calls
+    ]
+    assert "charged twice for October" in draft
+    assert "do NOT rewrite" in critique
+    assert "Return only the customer-facing reply" in revision
+    assert "Do not include critique, change notes" in revision and "Changes made" in revision
+    assert "Do not claim a refund has been issued" in revision
+    report = next(p for p in lab.printed if isinstance(p, dict) and "workflow_cost_usd" in p)
+    assert report["calls"] == 3
+    assert report["workflow_cost_usd"] == pytest.approx(sum(r["cost_usd"] for r in lab.ns["refinement_rows"]))
+
+
 def test_cache_displays_raw_counters_without_an_extra_call(lab):
     lab.usage.update({
         "cacheReadInputTokens": 80, "cacheWriteInputTokens": 20,

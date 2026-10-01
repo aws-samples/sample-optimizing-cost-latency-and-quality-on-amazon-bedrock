@@ -7,12 +7,67 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Any
 
+# Native JSON contracts constrain shape, not the correct fixture answers.
+# Empty evidence, unknown facts, and incorrect claims still reach the checks below.
+SUMMARY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "evidence": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "exchange_id": {"type": "string"},
+                    "quote": {
+                        "type": "string",
+                        "description": "One complete original user sentence, copied verbatim. Never join sentences.",
+                    },
+                },
+                "required": ["exchange_id", "quote"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["evidence"],
+    "additionalProperties": False,
+}
+
+ANSWER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "headset_model": {"type": "string"},
+        "constraints": {
+            "type": "array",
+            "items": {"type": "string", "enum": ["no_software_install", "no_factory_reset"]},
+        },
+        "failed_checks": {
+            "type": "array",
+            "items": {"type": "string", "enum": ["cable_swap", "other_device"]},
+        },
+        "next_action": {
+            "type": "string", "enum": ["hardware_diagnostic", "cable_swap", "other_device", "unknown"],
+        },
+        "diagnostic_status": {"type": "string", "enum": ["pending", "completed", "unknown"]},
+        "replacement_status": {"type": "string", "enum": ["approved", "not_approved", "unknown"]},
+    },
+    "required": [
+        "headset_model", "constraints", "failed_checks", "next_action",
+        "diagnostic_status", "replacement_status",
+    ],
+    "additionalProperties": False,
+}
+
 
 @dataclass(frozen=True)
 class Exchange:
     exchange_id: str
     user: str
     assistant: str
+
+
+def _user_sentences(text: str) -> list[str]:
+    """Use identical sentence boundaries in summary requests and validation."""
+    return re.split(r"(?<=[.!?])\s+", text)
 
 
 class RollingContext:
@@ -75,7 +130,8 @@ class RollingContext:
         return json.dumps({
             "previous_evidence": self.summary,
             "newly_evicted_exchanges": [
-                asdict(e) for e in self.recent[:-self.keep_exchanges]
+                {"exchange_id": e.exchange_id, "user_sentences": _user_sentences(e.user)}
+                for e in self.recent[:-self.keep_exchanges]
             ],
         })
 
@@ -109,7 +165,7 @@ class RollingContext:
             eid, quote = entry["exchange_id"], entry["quote"]
             # Full sentences retain negation; a substring such as 'approved'
             # cannot pass by matching 'No replacement has been approved.'
-            sentences = re.split(r"(?<=[.!?])\s+", covered[eid].user) if eid in covered else []
+            sentences = _user_sentences(covered[eid].user) if eid in covered else []
             if not quote.strip() or quote not in sentences:
                 errors.append(f"Not a verbatim user sentence from eligible history: {eid}: {quote}")
             if (eid, quote) in quotes:

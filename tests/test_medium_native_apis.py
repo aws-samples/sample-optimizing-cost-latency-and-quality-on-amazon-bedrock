@@ -267,6 +267,9 @@ def test_guardrail_trial_displays_native_config_trace_and_always_cleans_up(fail_
 
 
 def test_context_preview_exposes_actual_request_and_character_trigger_without_calls():
+    from workshop_utils.bedrock import build_converse_request
+    from workshop_utils.models import resolve_model
+
     spec = importlib.util.spec_from_file_location(
         "medium_preview_context", ROOT / "02-optimization-playbook/utils/context_management.py",
     )
@@ -276,8 +279,11 @@ def test_context_preview_exposes_actual_request_and_character_trigger_without_ca
         spec.loader.exec_module(module)
         namespace = {
             "os": SimpleNamespace(environ={}), "SMALL": MODEL_ID,
+            "json": json, "REGION": "us-east-1",
+            "build_converse_request": build_converse_request, "resolve_model": resolve_model,
             **{name: getattr(module, name) for name in (
                 "Exchange", "RollingContext", "answer_checks", "call_totals",
+                "SUMMARY_SCHEMA", "ANSWER_SCHEMA",
             )},
             "print": Mock(),
         }
@@ -289,6 +295,8 @@ def test_context_preview_exposes_actual_request_and_character_trigger_without_ca
     preview = namespace["print"].call_args.args[0]
     state = namespace["preview_state"]
     assert namespace["context_request_preview"]["messages"] == state.messages(namespace["CHECKPOINTS"][4])
+    assert namespace["context_request_preview"]["outputConfig"] == namespace["ANSWER_OUTPUT_CONFIG"]
+    assert namespace["summary_request_preview"]["outputConfig"] == namespace["SUMMARY_OUTPUT_CONFIG"]
     assert preview["context_characters"] == state.context_chars(
         namespace["CHECKPOINTS"][4], namespace["ANSWER_SYSTEM"],
     )

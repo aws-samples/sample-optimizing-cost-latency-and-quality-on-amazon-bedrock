@@ -73,8 +73,43 @@ def test_lost_constraint_rejected_without_discarding_history(state):
     assert state.summary == []
 
 
+def test_summary_request_contains_user_sentences_without_assistant_or_oracle():
+    state = cm.RollingContext(keep_exchanges=1, required_evidence={"E1": ["ORACLE_ONLY"]})
+    state.append(cm.Exchange(
+        "E1", "Do not reset.\nUse written steps!\tApproval pending?  Wait.", "ASSISTANT_ONLY",
+    ))
+    state.append(cm.Exchange("E2", "Recent exchange.", "Acknowledged."))
+    request = json.loads(state.summary_request())
+    assert request == {
+        "previous_evidence": [],
+        "newly_evicted_exchanges": [{
+            "exchange_id": "E1",
+            "user_sentences": ["Do not reset.", "Use written steps!", "Approval pending?", "Wait."],
+        }],
+    }
+    assert "ORACLE_ONLY" not in state.summary_request()
+    assert "ASSISTANT_ONLY" not in state.summary_request()
+    # With no oracle requirements, each advertised sentence is accepted verbatim.
+    state.required_evidence = {}
+    assert not state.accept_summary(
+        summary(*[("E1", sentence) for sentence in request["newly_evicted_exchanges"][0]["user_sentences"]]),
+        stop_reason="end_turn",
+    )
+
+
+def test_whole_user_paragraph_is_rejected_even_when_required_facts_are_also_present(state):
+    before = state.messages("Next?")
+    errors = state.accept_summary(
+        summary(*FIRST, ("E1", state.archive[0].user)), stop_reason="end_turn",
+    )
+    assert any("Not a verbatim user sentence" in error for error in errors)
+    assert not any("Missing required evidence" in error for error in errors)
+    assert state.messages("Next?") == before and state.summary == []
+
+
 @pytest.mark.parametrize("text,stop", [
     ("not json", "end_turn"),
+    ("```json\n" + summary(*FIRST) + "\n```", "end_turn"),
     ('{"evidence":[]}', "end_turn"),
     ('{"evidence":"bad"}', "end_turn"),
     ('{"evidence":[], "invented_field":true}', "end_turn"),
@@ -98,6 +133,9 @@ def test_repeated_summary_carries_old_evidence_and_only_newly_evicted_pairs(stat
     request = json.loads(state.summary_request())
     assert request["previous_evidence"] == state.summary
     assert [e["exchange_id"] for e in request["newly_evicted_exchanges"]] == ["E2"]
+    assert request["newly_evicted_exchanges"][0]["user_sentences"][0] == (
+        "Correction: my headset is H-220, not H-200."
+    )
     # A correction does not justify forgetting an unrelated constraint.
     assert state.accept_summary(
         summary(("E2", "Correction: my headset is H-220, not H-200.")),
@@ -186,10 +224,27 @@ def test_quality_gate_detects_lost_constraint_stale_fact_and_false_completion():
         ("failed_checks", []),
         ("diagnostic_status", "completed"),
         ("replacement_status", "approved"),
+        ("replacement_status", "unknown"),
     ]:
         assert not all(cm.answer_checks(json.dumps({**correct, key: value}), "end_turn").values())
     assert not all(cm.answer_checks(json.dumps(correct), "max_tokens").values())
     assert not all(cm.answer_checks("invalid", "end_turn").values())
+    assert not all(cm.answer_checks("```json\n" + json.dumps(correct) + "\n```", "end_turn").values())
+
+
+def test_native_schemas_do_not_encode_the_fixture_answers():
+    from jsonschema import validate
+
+    # Schema-valid output must still be allowed to fail the evidence/quality gates.
+    validate({"evidence": []}, cm.SUMMARY_SCHEMA)
+    validate({"evidence": [{"exchange_id": "E99", "quote": "Invented."}]}, cm.SUMMARY_SCHEMA)
+    wrong = {
+        "headset_model": "H-200", "constraints": [], "failed_checks": [],
+        "next_action": "cable_swap", "diagnostic_status": "completed", "replacement_status": "approved",
+    }
+    validate(wrong, cm.ANSWER_SCHEMA)
+    assert not all(cm.answer_checks(json.dumps(wrong), "end_turn").values())
+    assert "H-220" not in json.dumps(cm.ANSWER_SCHEMA)
 
 
 def notebook_cells():
@@ -198,7 +253,7 @@ def notebook_cells():
 
 
 def run_notebook_context(*, enabled=True, budget=4200, rejected=False, unpriced=False,
-                         retries=0, adapter="medium"):
+                         retries=0, adapter="medium", model_id=None, fenced=False):
     """Execute the real cells and run_case adapter, replacing only the wire call."""
     from workshop_utils.bedrock import build_converse_request, normalize_usage
     from workshop_utils.models import resolve_model
@@ -217,7 +272,8 @@ def run_notebook_context(*, enabled=True, budget=4200, rejected=False, unpriced=
         "hashlib": hashlib, "boto3": SimpleNamespace(__version__="offline"),
         "Exchange": cm.Exchange, "RollingContext": cm.RollingContext,
         "answer_checks": cm.answer_checks, "call_totals": cm.call_totals,
-        "SMALL": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "SUMMARY_SCHEMA": cm.SUMMARY_SCHEMA, "ANSWER_SCHEMA": cm.ANSWER_SCHEMA,
+        "SMALL": model_id or "global.anthropic.claude-haiku-4-5-20251001-v1:0",
         "REGION": "us-east-1", "RUNTIME": object(), "RUN_ID": "offline", "RUN_ROWS": [],
         "resolve_model": resolve_model, "build_converse_request": build_converse_request,
         "normalize_usage": normalize_usage, "calculate_cost": calculate_cost,
@@ -228,6 +284,8 @@ def run_notebook_context(*, enabled=True, budget=4200, rejected=False, unpriced=
     }
 
     def wire_call(client, **request):
+        from jsonschema import validate
+
         assert client is namespace["RUNTIME"]
         requests.append(request)
         system = request["system"][0]["text"]
@@ -235,10 +293,12 @@ def run_notebook_context(*, enabled=True, budget=4200, rejected=False, unpriced=
             source = json.loads(request["messages"][0]["content"][0]["text"])
             evidence = list(source["previous_evidence"])
             for exchange in source["newly_evicted_exchanges"]:
+                assert set(exchange) == {"exchange_id", "user_sentences"}
                 eid = exchange["exchange_id"]
                 evidence.extend(
                     {"exchange_id": eid, "quote": quote}
                     for quote in namespace["REQUIRED_EVIDENCE"].get(eid, [])
+                    if quote in exchange["user_sentences"]
                 )
             if rejected:
                 evidence = [e for e in evidence if "factory-reset" not in e["quote"]]
@@ -264,6 +324,13 @@ def run_notebook_context(*, enabled=True, budget=4200, rejected=False, unpriced=
                 "diagnostic_status": "pending" if "hardware diagnostic is still pending" in context else "unknown",
                 "replacement_status": "not_approved" if "No replacement has been approved." in context else "unknown",
             })
+        schema = request["outputConfig"]["textFormat"]["structure"]["jsonSchema"]
+        assert json.loads(schema["schema"]) == (
+            cm.SUMMARY_SCHEMA if system == namespace["SUMMARY_SYSTEM"] else cm.ANSWER_SCHEMA
+        )
+        validate(json.loads(text), json.loads(schema["schema"]))
+        if fenced:
+            text = "```json\n" + text + "\n```"
         return {
             "output": {"message": {"role": "assistant", "content": [{"text": text}]}},
             "usage": {"inputTokens": 100, "outputTokens": 20},
@@ -293,6 +360,13 @@ def run_notebook_context(*, enabled=True, budget=4200, rejected=False, unpriced=
     tree = ast.parse(cells["medium-context-fixture"])
     # Bind the same local helper through importlib to avoid other sections' utils packages.
     tree.body = [node for node in tree.body if not isinstance(node, ast.ImportFrom)]
+    if model_id is not None:
+        # Model the participant editing the comparison's explicit model setting.
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == "CONTEXT_MODEL" for target in node.targets
+            ):
+                node.value = ast.copy_location(ast.Constant(model_id), node.value)
     exec(compile(tree, "<context-fixture>", "exec"), namespace)
     namespace["CONTEXT_CHAR_BUDGET"] = budget
     exec(compile(cells["medium-context-comparison"], "<context-comparison>", "exec"), namespace)
@@ -314,11 +388,73 @@ def test_actual_notebook_comparison_preserves_evidence_and_accounts_for_every_ca
         assert result["sdk_retries"] == 0
         assert result["full_task_latency_ms"] >= result["summed_call_latency_ms"]
     for request in requests:
+        assert request["modelId"] == namespace["CONTEXT_MODEL"]
+        assert request["outputConfig"]["textFormat"]["type"] == "json_schema"
         roles = [m["role"] for m in request["messages"]]
         assert roles == ["user", "assistant"] * (len(roles) // 2) + ["user"]
         assert "required_evidence" not in json.dumps(request).lower()
     assert all(event["accepted"] for event in namespace["context_events"])
     assert any(event["after_chars"] < event["before_chars"] for event in namespace["context_events"])
+
+
+def test_actual_notebook_rejects_unsupported_override_without_model_fallback():
+    from workshop_utils.models import UnsupportedFeatureError
+
+    with pytest.raises(UnsupportedFeatureError, match="structured_output"):
+        run_notebook_context(model_id="global.anthropic.claude-sonnet-5")
+
+
+def test_actual_notebook_keeps_fenced_failures_and_their_costs():
+    namespace, _ = run_notebook_context(fenced=True)
+    for result in namespace["context_results"]:
+        assert result["checkpoints_passed"] == 0
+        assert result["summaries_accepted"] == 0
+        assert result["summaries_rejected"] == result["summary_calls"]
+        assert result["total_cost_usd"] > 0
+    assert all(len(state.recent) == 8 for state in namespace["context_states"].values())
+    assert all(row["text"].startswith("```json") for row in namespace["context_calls"])
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_results_print_bounded_untruncated_failures_without_more_model_calls(failed):
+    namespace, requests = run_notebook_context(fenced=failed)
+    before = len(requests)
+    namespace["print"], namespace["display"] = Mock(), Mock()
+    exec(notebook_cells()["medium-context-results"], namespace)
+    assert len(requests) == before
+    assert namespace["display"].call_count == 3  # Totals, answers, and summary events remain visible.
+    diagnostics = [
+        json.loads(call.args[0]) for call in namespace["print"].call_args_list
+        if call.args[0].startswith("{")
+    ]
+    if not failed:
+        assert diagnostics == []
+        return
+    assert len(diagnostics) == 5  # First answer per policy; first summary for the two compacting policies.
+    for diagnostic in diagnostics:
+        policy = diagnostic["policy"]
+        if "raw_summary" in diagnostic:
+            first = next(e for e in namespace["context_events"] if e["policy"] == policy and not e["accepted"])
+            assert diagnostic["raw_summary"] == first["summary_text"]
+            assert diagnostic["rejection_count"] == len(first["errors"])
+        else:
+            first = next(a for a in namespace["context_answers"] if a["policy"] == policy and not a["passed"])
+            assert diagnostic["raw_answer"] == first["answer"]
+            assert "format" in diagnostic["failed_checks"]
+        assert diagnostic["turn"] == first["turn"]
+
+
+def test_context_prompts_clarify_sentence_and_approval_contract_without_repeated_schema_dumps():
+    namespace, _ = run_notebook_context(enabled=False)
+    assert "exactly one complete original sentence" in namespace["SUMMARY_SYSTEM"]
+    assert "separate evidence items" in namespace["SUMMARY_SYSTEM"]
+    assert "no approval has been granted yet (this does not mean denial)" in namespace["ANSWER_SYSTEM"]
+    assert '"unknown" only when no reliable approval-status fact is available' in namespace["ANSWER_SYSTEM"]
+    assert "H-220" not in namespace["ANSWER_SYSTEM"]  # No fixture answer in the instructions.
+    # Preview still shows both schemas; the comparison loop does not dump them per request.
+    assert "answer_outputConfig" in notebook_cells()["medium-context-fixture"]
+    assert "summary_outputConfig" in notebook_cells()["medium-context-fixture"]
+    assert '"outputConfig":' not in notebook_cells()["medium-context-comparison"]
 
 
 @pytest.mark.parametrize("adapter", ["medium", "high"])

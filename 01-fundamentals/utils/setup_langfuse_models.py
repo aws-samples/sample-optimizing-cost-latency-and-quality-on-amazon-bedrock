@@ -18,6 +18,8 @@ from urllib.parse import urlsplit
 ROOT = Path(__file__).resolve().parents[2]
 
 DEFAULT_MODEL_ALIASES = ("workhorse", "small", "deep", "gpt-small", "gpt-workhorse")
+# HIGH's optional prompt comparisons use this model independently of role aliases.
+COMPARISON_MODEL_IDS = ("global.anthropic.claude-sonnet-4-6",)
 # Disjoint canonical meters emitted by observability.langfuse_usage_details.
 # Unpriced cache tokens still contribute to the per-request context threshold.
 INPUT_USAGE_KEYS = (
@@ -30,6 +32,12 @@ INPUT_USAGE_KEYS = (
     "cache_read_unpriced_input_tokens",
     "cache_write_unpriced_input_tokens",
 )
+# Same finite set as INPUT_USAGE_KEYS, factored to fit the server's 200-character
+# limit. No wildcards or repetitions: legacy/aggregate meters must not match.
+INPUT_USAGE_PATTERN = (
+    r"^(input|cache_(read|read_30m|read_unpriced|write_5m|write_1h|write_30m|write_unpriced)_input_tokens)$"
+)
+MAX_USAGE_PATTERN_LENGTH = 200
 REQUEST_OPTIONS = {"max_retries": 0, "timeout_in_seconds": 20}
 
 
@@ -46,7 +54,8 @@ def build_definitions() -> list[dict[str, Any]]:
     from workshop_utils.pricing import UnknownPriceError, get_price
 
     definitions = []
-    for model_id in dict.fromkeys(DEFAULT_ALIASES[alias] for alias in DEFAULT_MODEL_ALIASES):
+    model_ids = [DEFAULT_ALIASES[alias] for alias in DEFAULT_MODEL_ALIASES]
+    for model_id in dict.fromkeys([*model_ids, *COMPARISON_MODEL_IDS]):
         model = get_model(model_id)
         rate = get_price(model_id)  # Reject unknown/inferred rates; no fallback.
         if not model_id.startswith("global.") or rate.currency != "USD" or rate.service_tier != "standard":
@@ -65,11 +74,10 @@ def build_definitions() -> list[dict[str, Any]]:
             prices[f"cache_write_{ttl}_input_tokens"] = write_rate / 1_000_000
         tiers = [{"name": "Standard", "isDefault": True, "priority": 0, "conditions": [], "prices": prices}]
         if rate.long_context_threshold is not None:
-            pattern = "^(" + "|".join(re.escape(key) for key in INPUT_USAGE_KEYS) + ")$"
             tiers.append({
                 "name": "Long context", "isDefault": False, "priority": 1,
                 "conditions": [{
-                    "usageDetailPattern": pattern, "operator": "gt",
+                    "usageDetailPattern": INPUT_USAGE_PATTERN, "operator": "gt",
                     "value": rate.long_context_threshold, "caseSensitive": True,
                 }],
                 "prices": {
@@ -90,9 +98,17 @@ def build_definitions() -> list[dict[str, Any]]:
 
 
 def _model_request(body: dict[str, Any]) -> Any:
-    """Validate API bodies with public SDK types and their Python field names."""
+    """Validate SDK types plus the server's usage-pattern limit before any API call."""
     from langfuse.api import CreateModelRequest, PricingTierInput, PricingTierUsageConditionInput
 
+    for tier_index, tier in enumerate(body["pricingTiers"]):
+        for condition_index, condition in enumerate(tier["conditions"]):
+            if len(condition["usageDetailPattern"]) > MAX_USAGE_PATTERN_LENGTH:
+                raise ModelSetupError(
+                    f"{body['modelName']}: pricingTiers[{tier_index}].conditions[{condition_index}]"
+                    f".usageDetailPattern exceeds maximum length of {MAX_USAGE_PATTERN_LENGTH} characters; "
+                    "no definitions created"
+                )
     return CreateModelRequest(
         model_name=body["modelName"], match_pattern=body["matchPattern"],
         unit=body["unit"], start_date=body["startDate"],
@@ -127,6 +143,50 @@ def _signature(model: Any) -> dict[str, Any]:
             "prices": tier.prices,
         } for tier in model.pricing_tiers or []], key=lambda tier: tier["priority"]),
     }
+
+
+def _diagnostic_text(value: str) -> str:
+    """Bound validation text and redact keys/auth if a server echoes them."""
+    for name in ("LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY"):
+        if secret := os.environ.get(name, "").strip():
+            value = value.replace(secret, "[redacted]")
+    value = re.sub(r"\b(?:pk|sk)-[A-Za-z0-9_-]+", "[redacted key]", value)
+    value = re.sub(r"(?i)\b(?:Basic|Bearer)\s+\S+", "[redacted authorization]", value)
+    value = re.sub(
+        r"(?i)\b(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key)\s*:[^\r\n]*",
+        "[redacted header]", value,
+    )
+    value = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", value)
+    return " ".join(value.split())[:400]
+
+
+def _validation_diagnostics(exc: Exception) -> str | None:
+    """Expose only HTTP 400 validation messages/paths, never exception/header dumps."""
+    from langfuse.api.core.api_error import ApiError
+
+    if not isinstance(exc, ApiError) or exc.status_code != 400:
+        return None
+    details = ["HTTP 400"]
+    body = exc.body
+    if isinstance(body, dict):
+        if isinstance(body.get("message"), str):
+            details.append(_diagnostic_text(body["message"]))
+        issues = body.get("error")
+        if isinstance(issues, list):
+            for issue in issues[:8]:
+                if not isinstance(issue, dict) or not isinstance(issue.get("message"), str):
+                    continue
+                path = issue.get("path")
+                location = "request"
+                if isinstance(path, list) and all(isinstance(part, (str, int)) for part in path):
+                    location += "".join(
+                        f"[{part}]" if isinstance(part, int) else f".{_diagnostic_text(part)}"
+                        for part in path[:12]
+                    )
+                details.append(f"{location}: {_diagnostic_text(issue['message'])}")
+            if len(issues) > 8:
+                details.append("additional validation issues omitted")
+    return "; ".join(details)
 
 
 def setup_models(api: Any, definitions: list[dict[str, Any]]) -> list[dict[str, str]]:
@@ -190,9 +250,14 @@ def setup_models(api: Any, definitions: list[dict[str, Any]]) -> list[dict[str, 
                     pricing_tiers=request.pricing_tiers, request_options=REQUEST_OPTIONS,
                 )
             except Exception as exc:
-                raise ModelSetupError(
+                validation = _validation_diagnostics(exc)
+                outcome = (
+                    f"Create rejected for {request.model_name} ({validation}). "
+                    if validation else
                     f"Create outcome uncertain for {request.model_name} ({type(exc).__name__}). "
-                    "No automatic retry. Rerun this command to list and reconcile existing definitions."
+                )
+                raise ModelSetupError(
+                    outcome + "No automatic retry. Rerun this command to list and reconcile existing definitions."
                 ) from None
             persisted = api.models.get(match.id, request_options=REQUEST_OPTIONS)
             if _signature(persisted) != _signature(request):
