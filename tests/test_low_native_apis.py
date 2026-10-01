@@ -196,6 +196,138 @@ def test_email_contract_preserves_raw_failures_and_checks_every_required_detail(
     assert "deadline (requested timing, verbatim)" in lab.ns["STRUCTURED_PROMPT"]
 
 
+CLASSIFIED_EMAIL = {
+    "issue": "cracked screen; the charger is missing",
+    "sentiment": "negative", "action": "replacement",
+}
+
+
+def run_output_methods(lab, *, data=None, text=None, tool_calls=None,
+                       text_stop="end_turn", tool_stop="tool_use"):
+    """Supply responses to the existing native call recorder, never repair them."""
+    payload = copy.deepcopy(CLASSIFIED_EMAIL if data is None else data)
+    raw = json.dumps(payload) if text is None else text
+    proposed = copy.deepcopy(tool_calls) if tool_calls is not None else [{
+        "toolUseId": "tool-1", "name": "classify_email", "input": payload,
+    }]
+    original_converse = lab.ns["RUNTIME"].converse
+
+    def converse(**request):
+        response = original_converse(**request)
+        is_tool = "toolConfig" in request
+        response["output"]["message"]["content"] = (
+            [{"toolUse": call} for call in proposed] if is_tool else [{"text": raw}]
+        )
+        response["stopReason"] = tool_stop if is_tool else text_stop
+        return response
+
+    lab.ns["RUN_GPT"] = True
+    lab.ns["RUNTIME"].converse = converse
+    execute("low-08-d0e20408", lab.ns)
+    return lab.ns["output_method_rows"]
+
+
+def test_output_methods_share_customer_request_contract_and_report_content_separately(lab):
+    rows = run_output_methods(lab)
+    assert len(rows) == len(lab.calls) == 4  # Prompt, tool, native Haiku, native GPT.
+    assert all(r["schema_valid"] and r["semantic_valid"] and r["passed"] for r in rows)
+    assert all(all(r["semantic_checks"].values()) for r in rows)
+    assert [r["model_id"] for r in rows] == [
+        lab.ns["SMALL"], lab.ns["SMALL"], lab.ns["SMALL"], lab.ns["GPT"],
+    ]
+    properties = lab.ns["SCHEMA"]["properties"]
+    assert properties["issue"]["type"] == "string"
+    assert all(properties[name].get("description") for name in properties)
+    assert properties["action"]["enum"] == ["replacement", "refund", "repair", "other", "none"]
+    assert "customer" in properties["action"]["description"].lower()
+    assert "approval" in properties["action"]["description"].lower()
+    assert all(request["system"][0]["text"].startswith(lab.ns["EXTRACTION_RULES"]) for request in lab.calls)
+    native = [json.loads(request["outputConfig"]["textFormat"]["structure"]["jsonSchema"]["schema"])
+              for request in lab.calls if "outputConfig" in request]
+    tool_schema = lab.calls[1]["toolConfig"]["tools"][0]["toolSpec"]["inputSchema"]["json"]
+    assert native == [lab.ns["SCHEMA"], lab.ns["SCHEMA"]]
+    assert tool_schema == lab.ns["SCHEMA"]
+    reports = [p for p in lab.printed if isinstance(p, dict) and "semantic_checks" in p]
+    assert len(reports) == 4
+
+
+@pytest.mark.parametrize("issue", [
+    "cracked screen; missing charger",
+    "screen is cracked; charger is missing",
+])
+def test_output_methods_accept_equivalent_specific_defect_phrases(lab, issue):
+    rows = run_output_methods(lab, data={**CLASSIFIED_EMAIL, "issue": issue})
+    assert all(row["semantic_valid"] and row["passed"] for row in rows)
+
+
+@pytest.mark.parametrize("field,value,failed_check,schema_valid", [
+    ("issue", "damaged product and missing item", "cracked_screen", True),
+    ("issue", "cracked screen", "missing_charger", True),
+    ("issue", "the charger is missing", "cracked_screen", True),
+    ("issue", "screen is not cracked; missing charger", "cracked_screen", True),
+    ("issue", "cracked screen; charger is not missing", "missing_charger", True),
+    ("sentiment", "neutral", "negative_sentiment", True),
+    ("action", "refund", "requested_replacement", True),
+    ("action", "replacement request", "requested_replacement", False),
+    ("action", "Process replacement order and ship new unit", "requested_replacement", False),
+    ("action", "Send replacement order", "requested_replacement", False),
+    ("action", "Arrange replacement", "requested_replacement", False),
+])
+def test_output_methods_retain_raw_wrong_facts_and_fulfilment_assumptions(
+    lab, field, value, failed_check, schema_valid,
+):
+    payload = {**CLASSIFIED_EMAIL, field: value}
+    rows = run_output_methods(lab, data=payload)
+    assert all(r["schema_valid"] is schema_valid for r in rows)
+    assert all(not r["semantic_checks"][failed_check] and not r["passed"] for r in rows)
+    assert all(r["data"] == payload for r in rows)
+    assert len(lab.calls) == 4  # No rewrite, retry, model substitution or tool execution.
+    for result in rows:
+        row = result["row"]
+        if row["label"] == "L02-tool-choice":
+            assert row["response"]["output"]["message"]["content"][0]["toolUse"]["input"] == payload
+        else:
+            assert row["text"] == json.dumps(payload)
+
+
+@pytest.mark.parametrize("raw", [
+    "```json\n" + json.dumps(CLASSIFIED_EMAIL) + "\n```",
+    "Here is the result: " + json.dumps(CLASSIFIED_EMAIL),
+    "[]", "null",
+])
+def test_output_methods_never_repair_fences_or_nonobjects(lab, raw):
+    rows = run_output_methods(lab, text=raw)
+    text_rows = [r for r in rows if r["method"] != "L02-tool-choice"]
+    assert len(text_rows) == 3
+    assert all(not r["schema_valid"] and not r["passed"] for r in text_rows)
+    assert all(r["raw"] == r["row"]["text"] == raw for r in text_rows)
+    assert rows[1]["passed"]  # The separate valid tool proposal remains valid.
+
+
+@pytest.mark.parametrize("names", [[], ["wrong_tool"], ["classify_email", "classify_email"]])
+def test_output_methods_require_exactly_one_expected_forced_tool(lab, names):
+    proposals = [
+        {"toolUseId": f"call-{i}", "name": name, "input": copy.deepcopy(CLASSIFIED_EMAIL)}
+        for i, name in enumerate(names)
+    ]
+    rows = run_output_methods(lab, tool_calls=proposals)
+    result = rows[1]
+    assert result["tool_calls"] == len(proposals)
+    assert result["method_checks"]["one_expected_tool"] is False
+    assert not result["passed"]
+    assert result["raw"] == proposals
+    assert len(lab.calls) == 4
+
+
+@pytest.mark.parametrize("text_stop,tool_stop", [
+    ("max_tokens", "max_tokens"), ("guardrail_intervened", "end_turn"),
+])
+def test_output_methods_require_normal_completion_even_with_correct_payload(lab, text_stop, tool_stop):
+    rows = run_output_methods(lab, text_stop=text_stop, tool_stop=tool_stop)
+    assert all(r["schema_valid"] and r["semantic_valid"] for r in rows)
+    assert all(not r["method_checks"]["complete"] and not r["passed"] for r in rows)
+
+
 def test_self_refine_requests_only_customer_reply_and_keeps_three_call_measurement(lab):
     lab.ns["os"] = SimpleNamespace(environ={"RUN_SELF_REFINE": "1"})
     execute("low-18-d729885a", lab.ns)
