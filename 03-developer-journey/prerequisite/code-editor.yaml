@@ -1062,6 +1062,14 @@ Resources:
                   fi
                   WORKSHOP_DIR="${HomeFolder}"
                   cd "$WORKSHOP_DIR"
+                  # Initialize local settings as the participant without replacing existing values.
+                  sudo -H -u ${CodeEditorUser} bash -c '
+                    if [[ -f .env.example && ! -e .env && ! -L .env ]]; then
+                      umask 077
+                      set -o noclobber
+                      cat .env.example > .env
+                    fi
+                  '
                   # Both observability clients are ready before the first lab.
                   # Backend selection controls telemetry, not package installation.
                   LOCKFILE=requirements-langfuse.lock

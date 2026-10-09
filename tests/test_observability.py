@@ -197,6 +197,83 @@ def test_notebook_setup_reuses_the_canonical_environment_group(telemetry, monkey
     assert "x-aws-log-group=/canonical-from-code-editor," in os.environ["OTEL_EXPORTER_OTLP_LOGS_HEADERS"]
 
 
+@pytest.mark.parametrize("backend", ["agentcore", "langfuse", "both"])
+def test_fundamentals_visible_call_and_receipt_preserve_one_invocation(telemetry, monkeypatch, backend):
+    """Exercise the actual teaching cells without sending inference or telemetry."""
+    import time
+    from uuid import uuid4
+
+    import pandas as pd
+
+    from workshop_utils.bedrock import NormalizedUsage, build_converse_request, normalize_usage
+    from workshop_utils.metrics import metrics_records
+    from workshop_utils.models import resolve_model
+    from workshop_utils.pricing import (
+        AmbiguousCacheUsageError,
+        InferredPriceError,
+        UnknownPriceError,
+        calculate_cost,
+    )
+
+    notebook_path = Path(__file__).resolve().parents[1] / "01-fundamentals/02-observability-and-evaluation.ipynb"
+    cells = {
+        cell["id"]: "".join(cell["source"])
+        for cell in json.loads(notebook_path.read_text())["cells"]
+    }
+    state = obs.setup_observability(backend)
+    selected = resolve_model("global.anthropic.claude-sonnet-5", region="us-east-1")
+    response = {
+        "output": {"message": {"role": "assistant", "content": [
+            {"text": "A receipt and original packaging are required within 30 days."},
+        ]}},
+        "usage": {"inputTokens": 50, "outputTokens": 15},
+        "metrics": {"latencyMs": 20},
+        "stopReason": "end_turn",
+    }
+    original_response = copy.deepcopy(response)
+    runtime = Mock()
+    runtime.converse.return_value = response
+    display = Mock()
+    monkeypatch.setattr(obs, "call_converse", Mock(side_effect=AssertionError("Hidden model call")))
+    namespace = {
+        "time": time, "uuid4": uuid4, "pd": pd, "display": display,
+        "SELECTED": selected, "REGION": "us-east-1", "EFFORT": "low",
+        "telemetry": state, "runtime": runtime,
+        "converse_observation": obs.converse_observation,
+        "build_converse_request": build_converse_request,
+        "NormalizedUsage": NormalizedUsage, "normalize_usage": normalize_usage,
+        "metrics_records": metrics_records, "calculate_cost": calculate_cost,
+        "AmbiguousCacheUsageError": AmbiguousCacheUsageError,
+        "InferredPriceError": InferredPriceError, "UnknownPriceError": UnknownPriceError,
+    }
+
+    for cell_id in ("cell-009", "cell-011", "cell-013", "cell-015"):
+        exec(compile(cells[cell_id], f"{notebook_path}#{cell_id}", "exec"), namespace)
+
+    runtime.converse.assert_called_once_with(**namespace["request"])
+    assert response == original_response  # Correlation fields belong to the captured copy.
+    assert namespace["response"]["_trace"]["trace_id"] == namespace["TRACE_ID"]
+    (receipt,) = namespace["records"]
+    assert (receipt["input_tokens"], receipt["output_tokens"]) == (50, 15)
+    assert receipt["cost_usd"] > 0
+    assert receipt["ttft_ms"] is None
+    assert all(item["response"] == item["span"] for item in namespace["comparison"].values())
+    assert all(isinstance(call.args[0], pd.DataFrame) for call in display.call_args_list)
+
+    exec(compile(cells["cell-027"], f"{notebook_path}#follow-up-disabled", "exec"), namespace)
+    assert runtime.converse.call_count == 1
+    exec(compile(
+        cells["cell-027"].replace("RUN_TWO_TURN_EXERCISE = False", "RUN_TWO_TURN_EXERCISE = True"),
+        f"{notebook_path}#follow-up-enabled", "exec",
+    ), namespace)
+    assert runtime.converse.call_count == 2
+    assert namespace["turn_two"]["_trace"]["trace_id"] != namespace["TRACE_ID"]
+    assert namespace["turn_two"]["_trace"]["session_id"] == namespace["SESSION_ID"]
+    sent_history = runtime.converse.call_args.kwargs["messages"]
+    assert sent_history[1] == original_response["output"]["message"]
+    assert len(namespace["turn_two_records"]) == 1
+
+
 def test_log_routing_headers_are_not_valid_on_xray_trace_endpoint(telemetry):
     os.environ["OTEL_EXPORTER_OTLP_TRACES_HEADERS"] = "x-aws-log-group=/example,x-aws-log-stream=spans"
     with pytest.raises(ValueError, match="OTEL_EXPORTER_OTLP_TRACES_HEADERS"):
