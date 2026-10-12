@@ -8,15 +8,16 @@ import hashlib
 import json
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 
 from workshop_utils.bedrock import build_converse_request, normalize_usage
-from workshop_utils.models import Support, UnsupportedFeatureError, caps, resolve_model
+from workshop_utils.models import Support, UnsupportedFeatureError, caps, get_model, resolve_model
 from workshop_utils.observability import response_span
 from workshop_utils.pricing import (
     AmbiguousCacheUsageError,
@@ -45,7 +46,7 @@ def execute(cell_id, namespace):
 
 @pytest.fixture
 def lab():
-    calls, printed, recorded = [], [], []
+    calls, printed, recorded, displayed = [], [], [], []
     active = []
     raw_usage = {"inputTokens": 100, "outputTokens": 10}
     retry_attempts = [0]
@@ -83,13 +84,22 @@ def lab():
             "ResponseMetadata": {"RetryAttempts": retry_attempts[0]},
         }
 
+    def capture_print(*args, **kwargs):
+        for value in args:
+            if isinstance(value, str):
+                with suppress(ValueError):
+                    value = json.loads(value)
+            printed.append(value)
+
     ns = {
         "REPO_ROOT": ROOT, "REGION": "us-east-1", "RUN_ID": "native-offline", "RUN_ROWS": [],
         "RUNTIME": SimpleNamespace(converse=converse),
         "boto3": SimpleNamespace(__version__="offline"),
         "converse_observation": observation, "response_span": response_span,
         "build_converse_request": build_converse_request, "normalize_usage": normalize_usage,
-        "caps": caps, "resolve_model": resolve_model, "Support": Support,
+        "caps": caps, "resolve_model": resolve_model, "get_model": get_model, "Support": Support,
+        "pd": pd, "display": displayed.append, "SHOW_REQUEST_DETAILS": True,
+        "RUN_PREFIX_CHANGE": False, "RUN_SELF_REFINE": False,
         "calculate_cost": calculate_cost, "UnknownPriceError": UnknownPriceError,
         "InferredPriceError": InferredPriceError, "AmbiguousCacheUsageError": AmbiguousCacheUsageError,
         "SMALL": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
@@ -97,7 +107,7 @@ def lab():
         "GPT": "global.openai.gpt-5.6-luna", "RUN_GPT": False,
         "hashlib": hashlib, "json": json, "time": time, "uuid": uuid,
         "datetime": datetime, "UTC": UTC,
-        "print": lambda *args, **kwargs: printed.extend(args),
+        "print": capture_print,
     }
     functions = [
         node for node in ast.parse(cells()["low-setup-9d7ad99d"]).body
@@ -105,7 +115,7 @@ def lab():
     ]
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(NOTEBOOK), "exec"), ns)
     return SimpleNamespace(ns=ns, calls=calls, printed=printed, recorded=recorded,
-                           usage=raw_usage, retry_attempts=retry_attempts)
+                           usage=raw_usage, retry_attempts=retry_attempts, displayed=displayed)
 
 
 def test_native_converse_records_the_same_single_response(lab):
@@ -133,8 +143,8 @@ def test_sdk_retry_keeps_returned_response_cost_but_not_a_false_total(lab):
     assert isinstance(row["price_note"], str)
     assert "earlier attempts is unknown" in row["price_note"]
     execute("low-03-88a27752", lab.ns)
-    reports = [p for p in lab.printed if isinstance(p, dict) and "model_cost_per_solved" in p]
-    assert reports and all(p["model_cost"] is None and p["model_cost_per_solved"] is None for p in reports)
+    reports = lab.ns["selection_summary"]
+    assert reports and all(p["Model cost (USD)"] is None and p["USD / solved task"] is None for p in reports)
 
 
 def test_native_request_still_validates_before_inference(lab):
@@ -148,7 +158,10 @@ def test_representative_cells_preserve_call_counts_and_show_sent_fields(lab):
         ("low-03-88a27752", 8),
         ("low-05-9ee8d1ad", 2),
         ("low-06-761f76d3", 6),
-        ("low-08-d0e20408", 3),
+        ("low-08-d0e20408", 0),
+        ("low-prompted-json", 1),
+        ("low-forced-tool", 1),
+        ("low-native-schema", 1),
         ("low-10-0a475b0d", 2),
         ("low-temperature-comparison", 9),
         ("low-stop-sequence-comparison", 2),
@@ -223,7 +236,8 @@ def run_output_methods(lab, *, data=None, text=None, tool_calls=None,
 
     lab.ns["RUN_GPT"] = True
     lab.ns["RUNTIME"].converse = converse
-    execute("low-08-d0e20408", lab.ns)
+    for cell_id in ("low-08-d0e20408", "low-prompted-json", "low-forced-tool", "low-native-schema"):
+        execute(cell_id, lab.ns)
     return lab.ns["output_method_rows"]
 
 
@@ -247,8 +261,7 @@ def test_output_methods_share_customer_request_contract_and_report_content_separ
     tool_schema = lab.calls[1]["toolConfig"]["tools"][0]["toolSpec"]["inputSchema"]["json"]
     assert native == [lab.ns["SCHEMA"], lab.ns["SCHEMA"]]
     assert tool_schema == lab.ns["SCHEMA"]
-    reports = [p for p in lab.printed if isinstance(p, dict) and "semantic_checks" in p]
-    assert len(reports) == 4
+    assert len(rows) == 4 and all("semantic_checks" in row for row in rows)
 
 
 @pytest.mark.parametrize("issue", [
@@ -329,7 +342,7 @@ def test_output_methods_require_normal_completion_even_with_correct_payload(lab,
 
 
 def test_self_refine_requests_only_customer_reply_and_keeps_three_call_measurement(lab):
-    lab.ns["os"] = SimpleNamespace(environ={"RUN_SELF_REFINE": "1"})
+    lab.ns["RUN_SELF_REFINE"] = True
     execute("low-18-d729885a", lab.ns)
     assert len(lab.calls) == 3
     draft, critique, revision = [
@@ -340,7 +353,7 @@ def test_self_refine_requests_only_customer_reply_and_keeps_three_call_measureme
     assert "Return only the customer-facing reply" in revision
     assert "Do not include critique, change notes" in revision and "Changes made" in revision
     assert "Do not claim a refund has been issued" in revision
-    report = next(p for p in lab.printed if isinstance(p, dict) and "workflow_cost_usd" in p)
+    report = lab.ns["refinement_summary"]
     assert report["calls"] == 3
     assert report["workflow_cost_usd"] == pytest.approx(sum(r["cost_usd"] for r in lab.ns["refinement_rows"]))
 
@@ -486,3 +499,36 @@ def test_inline_evaluate_matches_installed_sdk_shape(evaluation):
             stubber.assert_no_pending_responses()
     finally:
         client.close()
+
+
+@pytest.mark.parametrize("settings_id,experiment_id,flag", [
+    ("low-prefix-options", "low-cache-change", "RUN_PREFIX_CHANGE"),
+    ("low-responses-options", "low-14-53f48222", "RUN_GPT_RESPONSES"),
+    ("low-refine-options", "low-18-d729885a", "RUN_SELF_REFINE"),
+    ("low-bounded-options", "low-20-0e46be9c", "RUN_BOUNDED_TASK"),
+])
+def test_visible_optional_settings_default_off_without_calls(lab, settings_id, experiment_id, flag):
+    execute(settings_id, lab.ns)
+    assert lab.ns[flag] is False
+    lab.ns["RUN_GPT"] = True  # Enabling provider comparisons must not enable a separate optional API.
+    execute(experiment_id, lab.ns)
+    assert not lab.calls
+    assert "environ.get(\"RUN_" not in cells()[experiment_id]
+
+
+def test_visible_gpt_option_controls_the_model_comparison(lab):
+    options = cells()["low-options"].replace("RUN_GPT = False", "RUN_GPT = True")
+    exec(compile(options, str(NOTEBOOK), "exec"), lab.ns)
+    execute("low-03-88a27752", lab.ns)
+    assert len(lab.calls) == 12
+    assert {call["modelId"] for call in lab.calls} == {lab.ns["SMALL"], lab.ns["WORKHORSE"], lab.ns["GPT"]}
+
+
+def test_unparseable_output_is_not_reported_as_wrong_facts(lab):
+    rows = run_output_methods(lab, text="```json\n" + json.dumps(CLASSIFIED_EMAIL) + "\n```")
+    for row in rows:
+        if row["method"] != "L02-tool-choice":
+            assert row["schema_valid"] is False
+            assert row["semantic_valid"] is None
+            assert all(value is None for value in row["semantic_checks"].values())
+            assert row["passed"] is False

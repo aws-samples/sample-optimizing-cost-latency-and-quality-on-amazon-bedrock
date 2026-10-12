@@ -76,6 +76,109 @@ class RequestTests(unittest.TestCase):
         with self.assertRaises(UnsupportedFeatureError):
             build_converse_request("global.openai.gpt-6-sol", MESSAGES, output_config=FORMAT)
 
+    def test_gpt_schema_adds_strict_without_changing_caller_inputs_or_reasoning(self):
+        for model in (LUNA, GPT):
+            for fields in (None, {}, {"reasoning": {"effort": "low"}}):
+                with self.subTest(model=model, fields=fields):
+                    output_config = deepcopy(FORMAT)
+                    original_fields = deepcopy(fields)
+                    request = build_converse_request(
+                        model, MESSAGES, output_config=output_config,
+                        additional_model_request_fields=fields,
+                    )
+                    expected = deepcopy(fields or {})
+                    expected["text"] = {"format": {"strict": True}}
+                    self.assertEqual(request["additionalModelRequestFields"], expected)
+                    self.assertEqual(request["outputConfig"], FORMAT)
+                    request["additionalModelRequestFields"]["text"]["format"]["strict"] = False
+                    request["outputConfig"]["textFormat"]["structure"]["jsonSchema"]["name"] = "changed"
+                    self.assertEqual(fields, original_fields)
+                    self.assertEqual(output_config, FORMAT)
+
+    def test_gpt_schema_accepts_explicit_strict_with_both_reasoning_input_paths(self):
+        for model in (LUNA, GPT):
+            for controls in (
+                {"effort": "low"},
+                {"additional_model_request_fields": {"reasoning": {"effort": "low"}}},
+            ):
+                with self.subTest(model=model, controls=controls):
+                    fields = deepcopy(controls.get("additional_model_request_fields", {}))
+                    fields["text"] = {"format": {"strict": True}}
+                    original_fields = deepcopy(fields)
+                    request = build_converse_request(
+                        model, MESSAGES, output_config=FORMAT,
+                        **{**controls, "additional_model_request_fields": fields},
+                    )
+                    self.assertEqual(
+                        request["additionalModelRequestFields"],
+                        {"reasoning": {"effort": "low"}, "text": {"format": {"strict": True}}},
+                    )
+                    request["additionalModelRequestFields"]["reasoning"]["effort"] = "high"
+                    request["additionalModelRequestFields"]["text"]["format"]["strict"] = False
+                    self.assertEqual(fields, original_fields)
+
+    def test_gpt_schema_rejects_false_malformed_or_extra_text_fields(self):
+        for text in (
+            None, True, "json", [],
+            {},
+            {"strict": True},
+            {"format": None},
+            {"format": []},
+            {"format": "json_schema"},
+            {"format": {}},
+            {"format": {"strict": False}},
+            {"format": {"strict": None}},
+            {"format": {"strict": "true"}},
+            {"format": {"strict": 1}},
+            {"format": {"strict": True, "type": "json_schema"}},
+            {"format": {"strict": True}, "verbosity": "low"},
+        ):
+            with self.subTest(text=text), self.assertRaisesRegex(UnsupportedFeatureError, "text"):
+                build_converse_request(
+                    LUNA, MESSAGES, output_config=FORMAT,
+                    additional_model_request_fields={"text": text},
+                )
+
+    def test_strict_text_is_rejected_without_gpt_schema_output(self):
+        for model, controls in (
+            (LUNA, {}),
+            (GPT, {}),
+            (HAIKU, {}),
+            (HAIKU, {"output_config": FORMAT}),
+            (SONNET, {}),
+        ):
+            with self.subTest(model=model, controls=controls), self.assertRaises(UnsupportedFeatureError):
+                build_converse_request(
+                    model, MESSAGES, **controls,
+                    additional_model_request_fields={"text": {"format": {"strict": True}}},
+                )
+
+    def test_schema_requests_still_require_structured_output_capability(self):
+        for model, error in (
+            ("global.openai.gpt-5.6-sol", UnsupportedFeatureError),
+            ("global.openai.gpt-6-sol", UnsupportedFeatureError),
+            (SONNET, UnsupportedFeatureError),
+            (NOVA, UnknownCapabilityError),
+        ):
+            for fields in (None, {"text": {"format": {"strict": True}}}):
+                with self.subTest(model=model, fields=fields), self.assertRaisesRegex(error, "structured_output"):
+                    build_converse_request(
+                        model, MESSAGES, output_config=FORMAT,
+                        additional_model_request_fields=fields,
+                    )
+
+    def test_plain_and_claude_schema_requests_do_not_gain_strict_text(self):
+        for model, controls in (
+            (LUNA, {}),
+            (GPT, {}),
+            (HAIKU, {}),
+            (HAIKU, {"output_config": FORMAT}),
+            (SONNET, {"effort": "low"}),
+        ):
+            with self.subTest(model=model, controls=controls):
+                request = build_converse_request(model, MESSAGES, **controls)
+                self.assertNotIn("text", request.get("additionalModelRequestFields", {}))
+
     def test_requests_validate_against_installed_botocore_schema(self):
         try:
             import botocore.session
@@ -88,6 +191,7 @@ class RequestTests(unittest.TestCase):
             build_converse_request(SONNET, MESSAGES, effort="low", service_tier="standard"),
             build_converse_request(GPT, MESSAGES, effort="none"),
             build_converse_request(LUNA, MESSAGES, effort="none"),
+            build_converse_request(LUNA, MESSAGES, output_config=FORMAT, effort="low"),
             *(
                 build_converse_request(NOVA, MESSAGES, max_tokens=128, service_tier=tier)
                 for tier in ("standard", "flex", "priority")

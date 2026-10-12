@@ -203,16 +203,29 @@ def _validate_provider_fields(
     model: ResolvedModel,
     *,
     max_tokens: int,
+    structured_output: bool = False,
 ) -> None:
     effort_key = _effort_key(model)
     allowed = {effort_key}
     if model.provider == "anthropic":
         allowed |= {"thinking", "top_k"}
+    elif model.provider == "openai" and structured_output:
+        allowed.add("text")
     unknown = set(fields) - allowed
     if unknown:
         raise UnsupportedFeatureError(
             f"Unsupported provider fields for {model.model_id}: {sorted(unknown)}. Effort belongs in {effort_key}."
         )
+    if "text" in fields:
+        text = fields["text"]
+        if (
+            not isinstance(text, Mapping)
+            or set(text) != {"format"}
+            or not isinstance(text["format"], Mapping)
+            or set(text["format"]) != {"strict"}
+            or text["format"]["strict"] is not True
+        ):
+            raise UnsupportedFeatureError("Only text.format.strict=true is implemented for GPT schema output")
     effort = None
     if effort_key in fields:
         model.capabilities.require("effort")
@@ -290,6 +303,8 @@ def build_converse_request(
     output_config is Converse's outputConfig (textFormat only). Native Claude
     output_config.effort and GPT-5.6 reasoning.effort go into AMRF via effort=,
     subject to exact-model capability verification.
+    Supported GPT schema requests require AMRF text.format.strict=true. It is
+    added when text is absent; supplied text must have exactly that shape.
     Supplied AMRF is validated too; it is not an escape hatch around capabilities.
     service_tier="standard" uses the boto3 wire value "default".
     """
@@ -317,7 +332,14 @@ def build_converse_request(
             request["inferenceConfig"][wire] = value
     if selected.provider == "anthropic" and temperature is not None and top_p is not None:
         raise UnsupportedFeatureError("Select either temperature or top_p for these Claude models")
+    if output_config is not None:
+        capability.require("structured_output")
+        if set(output_config) != {"textFormat"}:
+            raise UnsupportedFeatureError("Only Converse outputConfig.textFormat is implemented")
+        request["outputConfig"] = deepcopy(dict(output_config))
     fields = deepcopy(dict(additional_model_request_fields or {}))
+    if selected.provider == "openai" and output_config is not None:
+        fields.setdefault("text", {"format": {"strict": True}})
     effort_key = _effort_key(selected)
     if effort is not None:
         if effort_key in fields:
@@ -328,7 +350,7 @@ def build_converse_request(
             if name in fields:
                 raise ValueError(f"{name} is specified twice")
             fields[name] = deepcopy(value)
-    _validate_provider_fields(fields, selected, max_tokens=max_tokens)
+    _validate_provider_fields(fields, selected, max_tokens=max_tokens, structured_output=output_config is not None)
     if fields.get("thinking", {}).get("type") in {"adaptive", "enabled"} and (
         any(value is not None for value in (temperature, top_p, top_k)) or "top_k" in fields
     ):
@@ -366,11 +388,6 @@ def build_converse_request(
         if fields.get("thinking", {}).get("type") == "enabled" and set(choice) != {"auto"}:
             raise UnsupportedFeatureError("Extended thinking requires auto tool choice")
         request["toolConfig"] = deepcopy(dict(tool_config))
-    if output_config is not None:
-        capability.require("structured_output")
-        if set(output_config) != {"textFormat"}:
-            raise UnsupportedFeatureError("Only Converse outputConfig.textFormat is implemented")
-        request["outputConfig"] = deepcopy(dict(output_config))
     if guardrail_config is not None:
         capability.require("guardrails")
         request["guardrailConfig"] = deepcopy(dict(guardrail_config))

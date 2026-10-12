@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import copy
 import hashlib
+import importlib.util
 import json
 import time
 import uuid
@@ -13,10 +14,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 
 from workshop_utils.bedrock import build_converse_request, normalize_usage
-from workshop_utils.models import Support, caps, resolve_model
+from workshop_utils.models import Support, caps, get_model, resolve_model
 from workshop_utils.pricing import (
     AmbiguousCacheUsageError,
     InferredPriceError,
@@ -25,6 +27,12 @@ from workshop_utils.pricing import (
 )
 
 NOTEBOOK = Path(__file__).resolve().parents[1] / "02-optimization-playbook/01-low-effort.ipynb"
+_scorer_path = NOTEBOOK.parent / "utils/effort_scoring.py"
+_scorer_spec = importlib.util.spec_from_file_location("low_effort_scoring", _scorer_path)
+_scorer = importlib.util.module_from_spec(_scorer_spec)
+_scorer_spec.loader.exec_module(_scorer)
+score_effort_answer = _scorer.score_effort_answer
+
 SONNET = "global.anthropic.claude-sonnet-5"
 HAIKU = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
 LUNA = "global.openai.gpt-5.6-luna"
@@ -38,7 +46,7 @@ def code_cells():
     }
 
 
-def run_comparison(*, include_gpt=False, workhorse=SONNET, truncated_effort=None):
+def run_comparison(*, include_gpt=False, workhorse=SONNET, truncated_effort=None, formatting=False):
     cells = code_cells()
     functions = [
         node for node in ast.parse(cells["low-setup-9d7ad99d"]).body
@@ -49,7 +57,9 @@ def run_comparison(*, include_gpt=False, workhorse=SONNET, truncated_effort=None
         "WORKHORSE": workhorse, "GPT": LUNA, "RUN_GPT": include_gpt,
         "REGION": "us-east-1", "RUNTIME": object(), "RUN_ID": "offline-evaluation",
         "RUN_ROWS": [], "boto3": SimpleNamespace(__version__="offline"),
-        "caps": caps, "resolve_model": resolve_model, "Support": Support,
+        "caps": caps, "resolve_model": resolve_model, "get_model": get_model, "Support": Support,
+        "pd": pd, "display": lambda value: None, "SHOW_REQUEST_DETAILS": False,
+        "score_effort_answer": score_effort_answer,
         "build_converse_request": build_converse_request, "normalize_usage": normalize_usage,
         "calculate_cost": calculate_cost, "UnknownPriceError": UnknownPriceError,
         "InferredPriceError": InferredPriceError, "AmbiguousCacheUsageError": AmbiguousCacheUsageError,
@@ -65,8 +75,13 @@ def run_comparison(*, include_gpt=False, workhorse=SONNET, truncated_effort=None
         fields = request["additionalModelRequestFields"]
         effort = (fields.get("output_config") or fields.get("reasoning"))["effort"]
         output = {"low": 10, "medium": 20, "high": 40}[effort]
+        answer = task["expected"]
+        if formatting and effort != "low" and task["id"] == "missing-evidence":
+            answer = "**ask_for_receipt**\n\nThe receipt is the missing policy requirement."
+        if formatting and effort == "high" and task["id"] == "arithmetic" and len(sent) % 2 == 0:
+            answer = "**6195**"
         return {
-            "output": {"message": {"role": "assistant", "content": [{"text": task["expected"]}]}},
+            "output": {"message": {"role": "assistant", "content": [{"text": answer}]}},
             "usage": {"inputTokens": 100, "outputTokens": output, "totalTokens": 100 + output},
             "stopReason": "max_tokens" if effort == truncated_effort else "end_turn",
         }
@@ -79,6 +94,7 @@ def run_comparison(*, include_gpt=False, workhorse=SONNET, truncated_effort=None
     namespace["RUNTIME"] = SimpleNamespace(converse=response_fixture)
     namespace["converse_observation"] = observation_fixture
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(NOTEBOOK), "exec"), namespace)
+    exec(compile(cells["low-effort-options"], str(NOTEBOOK), "exec"), namespace)
     exec(compile(cells["low-reasoning-effort-sweep"], str(NOTEBOOK), "exec"), namespace)
     return namespace, sent, printed
 
@@ -87,7 +103,7 @@ def summarize(namespace, **requirements):
     namespace = {**namespace, **requirements}
     shown, printed = [], []
     namespace.update(
-        pd=SimpleNamespace(DataFrame=lambda rows: rows),
+        pd=pd,
         display=shown.append,
         print=lambda *args: printed.extend(args),
     )
@@ -129,31 +145,32 @@ def test_repeated_comparison_holds_requests_fixed_except_effort(include_gpt, exp
 
 def test_lowest_cost_passing_setting_wins_not_highest_effort():
     namespace, _, _ = run_comparison()
-    result, _, printed = summarize(namespace)
+    result, _, _printed = summarize(namespace)
     rows = result["effort_summary"]
     assert len(rows) == 3
     assert all(row["passed"] == row["attempts"] == 8 for row in rows)
     assert all(row["pass_rate"] == row["completion_rate"] == 1 for row in rows)
-    choice = printed[-1]["lowest_cost_passing_configuration_in_this_run"]
+    choice = result["choice"]
     assert choice["effort"] == "low"
     assert rows[0]["mean_cost_per_attempt_usd"] == pytest.approx(rows[0]["total_cost_usd"] / 8)
 
 
 def test_truncated_exact_answers_fail_quality_and_completion_gates():
     namespace, _, _ = run_comparison(truncated_effort="low")
-    result, _, printed = summarize(namespace)
+    result, _, _printed = summarize(namespace)
     low = result["effort_summary"][0]
     assert low["pass_rate"] == low["completion_rate"] == 0
     assert low["cost_per_success_usd"] is None
     assert not low["meets_requirements"]
     assert low["mean_cost_per_attempt_usd"] > 0
-    assert printed[-1]["lowest_cost_passing_configuration_in_this_run"]["effort"] == "medium"
+    assert result["choice"]["effort"] == "medium"
 
 
 def test_failed_attempts_are_included_in_cost_per_success():
     namespace, _, _ = run_comparison()
     low = [row for row in namespace["effort_rows"] if row["effort"] == "low"]
     low[0]["correct"] = False
+    low[0]["answer_correct"] = False
     low[0]["text"] = "incorrect"
     result, _, _ = summarize(namespace, MIN_PASS_RATE=0.8)
     aggregate = result["effort_summary"][0]
@@ -165,12 +182,12 @@ def test_failed_attempts_are_included_in_cost_per_success():
 def test_unknown_prices_stay_unknown_and_cannot_win():
     namespace, _, _ = run_comparison()
     namespace["effort_rows"][0]["cost_usd"] = None
-    result, _, printed = summarize(namespace)
+    result, _, _printed = summarize(namespace)
     low = result["effort_summary"][0]
     assert low["total_cost_usd"] is None
     assert low["mean_cost_per_attempt_usd"] is None
     assert low["cost_per_success_usd"] is None
-    assert printed[-1]["lowest_cost_passing_configuration_in_this_run"]["effort"] == "medium"
+    assert result["choice"]["effort"] == "medium"
 
 
 def test_latency_requirement_can_reject_every_configuration():
@@ -187,7 +204,7 @@ def test_model_without_effort_produces_no_fabricated_measurements():
     namespace, sent, _ = run_comparison(workhorse=HAIKU)
     result, shown, printed = summarize(namespace)
     assert not sent and not result["effort_summary"]
-    assert shown == [[]]
+    assert shown == []
     assert isinstance(printed[-1], str)
 
 
@@ -210,10 +227,28 @@ def test_chart_uses_measured_values_and_skips_unknown_cost(monkeypatch):
     monkeypatch.setattr(plt, "show", lambda: None)
     try:
         exec(code_cells()["low-effort-plots"], result)
-        cost_axis, latency_axis = result["axes"]
-        assert len(cost_axis.lines[0].get_xdata()) == 2
-        assert len(latency_axis.lines[0].get_xdata()) == 3
-        assert "per task attempt" in cost_axis.get_xlabel()
-        assert list(cost_axis.lines[0].get_ydata()) == [100, 100]
+        axis = result["ax"]
+        points = axis.collections[0]
+        assert len(points.get_offsets()) == 2
+        assert "per task attempt" in axis.get_xlabel()
+        assert axis.get_ylabel() == "Task success (%)"
+        assert list(points.get_offsets()[:, 1]) == [100, 100]
+        assert list(points.get_array()) == [r["mean_latency_ms"] for r in result["plot_rows"]]
+        assert len(result["fig"].axes) == 2  # One comparison and one latency colour bar.
+        assert result["fig"].axes[1].get_ylabel() == "Mean task latency (ms)"
     finally:
         plt.close("all")
+
+
+def test_format_variation_does_not_masquerade_as_wrong_reasoning():
+    namespace, sent, _ = run_comparison(formatting=True)
+    result, _, _ = summarize(namespace)
+    assert len(sent) == 24
+    assert [r["answer_matches"] for r in result["effort_summary"]] == [8, 8, 8]
+    assert [r["format_matches"] for r in result["effort_summary"]] == [8, 6, 5]
+    assert [r["passed"] for r in result["effort_summary"]] == [8, 8, 8]
+    assert any(row["text"] == "**6195**" for row in namespace["effort_rows"])
+    strict, _, _ = summarize(namespace, REQUIRE_EXACT_FORMAT=True)
+    assert [r["passed"] for r in strict["effort_summary"]] == [8, 6, 5]
+    assert len(sent) == 24  # Rescoring the retained results made no new calls.
+    assert [r["total_cost_usd"] for r in strict["effort_summary"]] == [r["total_cost_usd"] for r in result["effort_summary"]]
