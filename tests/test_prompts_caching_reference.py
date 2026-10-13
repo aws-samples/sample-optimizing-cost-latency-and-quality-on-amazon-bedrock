@@ -27,7 +27,14 @@ def test_streaming_and_optional_comparison_share_reference_and_keep_returned_tex
             self.closed = False
 
         def __iter__(self):
-            yield {"contentBlockDelta": {"delta": {"text": "Unverified fixture answer."}}}
+            yield {"contentBlockDelta": {"delta": {"text": ""}}}
+            if len(requests) == 1:
+                namespace["print"].assert_called_once_with("Waiting for the first text…", flush=True)
+            yield {"contentBlockDelta": {"delta": {"text": "Unverified "}}}
+            # Each example displays its first chunk before consuming the next.
+            namespace["print"].assert_called_with("Unverified ", end="", flush=True)
+            yield {"contentBlockDelta": {"delta": {"text": "fixture answer."}}}
+            namespace["print"].assert_called_with("fixture answer.", end="", flush=True)
             yield {"messageStop": {"stopReason": "end_turn"}}
             yield {"metadata": {
                 "usage": {"inputTokens": 60, "outputTokens": 5},
@@ -39,6 +46,11 @@ def test_streaming_and_optional_comparison_share_reference_and_keep_returned_tex
 
     def converse_stream(**request):
         requests.append(request)
+        if len(requests) > 1:
+            # The participant can inspect exactly what is sent before inference.
+            printed = namespace["print"].call_args.args[0]
+            assert request["messages"][0]["content"][0]["text"] in printed
+            assert printed.endswith("\n\nAnswer:")
         stream = Stream()
         streams.append(stream)
         return {"stream": stream}
@@ -52,6 +64,14 @@ def test_streaming_and_optional_comparison_share_reference_and_keep_returned_tex
     assert len(requests) == 1 and streams[0].closed
     assert namespace["latency_sample"]["text"] == "Unverified fixture answer."
     assert namespace["latency_sample"]["usage"]["inputTokens"] == 60
+    assert namespace["latency_sample"]["visible_ttft_ms"] is not None
+    assert namespace["latency_sample"]["e2e_ms"] >= namespace["latency_sample"]["visible_ttft_ms"]
+    namespace["print"].assert_called_with("\n", flush=True)
+    # Keep the full answer in the result without duplicating it in the summary.
+    assert namespace["display"].call_args.args[0] == {
+        key: value for key, value in namespace["latency_sample"].items() if key != "text"
+    }
+    namespace["print"].reset_mock()
     # Participant opt-in; enable only that flag in the authored comparison cell.
     source = CELLS["cell-024"].replace("RUN_LATENCY_COMPARISON = False", "RUN_LATENCY_COMPARISON = True")
     exec(compile(source, str(NOTEBOOK), "exec"), namespace)
@@ -77,9 +97,15 @@ def test_streaming_and_optional_comparison_share_reference_and_keep_returned_tex
         # Presentation must not discard or round the original evidence.
         assert sample["provider_ms"] == 123.456
         assert sample["text"] == "Unverified fixture answer."
+    short_prompt = requests[1]["messages"][0]["content"][0]["text"]
+    long_prompt = requests[2]["messages"][0]["content"][0]["text"]
+    assert "in one sentence." in short_prompt
+    assert long_prompt == short_prompt.replace("in one sentence.", "in six numbered paragraphs.")
     assert [call.args[0] for call in namespace["print"].call_args_list] == [
-        "\nOne sentence:\nUnverified fixture answer.",
-        "\nSix numbered paragraphs:\nUnverified fixture answer.",
+        f"\nOne-sentence prompt:\n{short_prompt}\n\nAnswer:",
+        "Unverified ", "fixture answer.", "\n",
+        f"\nSix-paragraph prompt:\n{long_prompt}\n\nAnswer:",
+        "Unverified ", "fixture answer.", "\n",
     ]
 
 
@@ -90,7 +116,7 @@ def test_latency_table_preserves_missing_measurements_and_real_zero_tokens(usage
         "visible_ttft_ms": None, "e2e_ms": 123.456, "provider_ms": None,
     }
     namespace = {"measure_latency": Mock(return_value=sample),
-                 "caching_explanation_prompt": str, "display": Mock(), "pd": pd, "print": Mock()}
+                 "CACHING_REFERENCE": "Offline reference.", "display": Mock(), "pd": pd, "print": Mock()}
     # Default opt-out must not make any calls.
     exec(compile(CELLS["cell-024"], str(NOTEBOOK), "exec"), namespace)
     namespace["measure_latency"].assert_not_called()

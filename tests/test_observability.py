@@ -201,6 +201,7 @@ def test_notebook_setup_reuses_the_canonical_environment_group(telemetry, monkey
 def test_fundamentals_visible_call_and_receipt_preserve_one_invocation(telemetry, monkeypatch, backend):
     """Exercise the actual teaching cells without sending inference or telemetry."""
     import time
+    from urllib.parse import parse_qs, urlsplit
     from uuid import uuid4
 
     import pandas as pd
@@ -238,7 +239,7 @@ def test_fundamentals_visible_call_and_receipt_preserve_one_invocation(telemetry
     namespace = {
         "time": time, "uuid4": uuid4, "pd": pd, "display": display,
         "SELECTED": selected, "REGION": "us-east-1", "EFFORT": "low",
-        "telemetry": state, "runtime": runtime,
+        "telemetry": state, "runtime": runtime, "BACKEND": backend,
         "converse_observation": obs.converse_observation,
         "build_converse_request": build_converse_request,
         "NormalizedUsage": NormalizedUsage, "normalize_usage": normalize_usage,
@@ -260,18 +261,35 @@ def test_fundamentals_visible_call_and_receipt_preserve_one_invocation(telemetry
     assert all(item["response"] == item["span"] for item in namespace["comparison"].values())
     assert all(isinstance(call.args[0], pd.DataFrame) for call in display.call_args_list)
 
-    exec(compile(cells["cell-027"], f"{notebook_path}#follow-up-disabled", "exec"), namespace)
+    exec(compile(cells["cell-022"], f"{notebook_path}#first-trace-link", "exec"), namespace)
     assert runtime.converse.call_count == 1
-    exec(compile(
-        cells["cell-027"].replace("RUN_TWO_TURN_EXERCISE = False", "RUN_TWO_TURN_EXERCISE = True"),
-        f"{notebook_path}#follow-up-enabled", "exec",
-    ), namespace)
+    first_url = namespace.get("CLOUDWATCH_URL")
+    if backend in {"agentcore", "both"}:
+        first_query = parse_qs(urlsplit(first_url).fragment.split("?", 1)[1])
+        assert first_query["traceId"] == [namespace["TRACE_ID"]]
+
+    display.reset_mock()
+    exec(compile(cells["cell-027"], f"{notebook_path}#follow-up", "exec"), namespace)
     assert runtime.converse.call_count == 2
     assert namespace["turn_two"]["_trace"]["trace_id"] != namespace["TRACE_ID"]
     assert namespace["turn_two"]["_trace"]["session_id"] == namespace["SESSION_ID"]
     sent_history = runtime.converse.call_args.kwargs["messages"]
     assert sent_history[1] == original_response["output"]["message"]
     assert len(namespace["turn_two_records"]) == 1
+    assert namespace.get("CLOUDWATCH_URL") == first_url  # Preserve the first turn's link.
+    if backend in {"agentcore", "both"}:
+        followup_url = namespace["FOLLOWUP_CLOUDWATCH_URL"]
+        parts = urlsplit(followup_url)
+        assert f"/session/{namespace['SESSION_ID']}?" in parts.fragment
+        followup_query = parse_qs(parts.fragment.split("?", 1)[1])
+        assert followup_query == {
+            "serviceName": [state.service_name], "source": ["agents"],
+            "traceId": [namespace["turn_two"]["_trace"]["trace_id"]],
+        }
+        assert display.call_args.args[0].data == f"[Open the follow-up trace in CloudWatch]({followup_url})"
+    else:
+        assert "FOLLOWUP_CLOUDWATCH_URL" not in namespace
+        assert all(isinstance(call.args[0], pd.DataFrame) for call in display.call_args_list)
 
 
 def test_log_routing_headers_are_not_valid_on_xray_trace_endpoint(telemetry):
