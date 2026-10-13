@@ -358,21 +358,45 @@ def test_self_refine_requests_only_customer_reply_and_keeps_three_call_measureme
     assert report["workflow_cost_usd"] == pytest.approx(sum(r["cost_usd"] for r in lab.ns["refinement_rows"]))
 
 
-def test_cache_displays_raw_counters_without_an_extra_call(lab):
+@pytest.mark.parametrize("retry_attempts", [0, 1])
+def test_cache_displays_raw_counters_once_without_an_extra_call(lab, retry_attempts):
     lab.usage.update({
         "cacheReadInputTokens": 80, "cacheWriteInputTokens": 20,
         "cacheDetails": [{"ttl": "5m", "inputTokens": 20}],
     })
+    lab.retry_attempts[0] = retry_attempts
     execute("low-cache-ttl-choice", lab.ns)
     execute("low-12-f22b2184", lab.ns)
     execute("low-cache-history", lab.ns)
     execute("low-cache-change", lab.ns)  # Remains gated off.
     assert len(lab.calls) == 4
-    displays = [p["Converse usage"] for p in lab.printed if isinstance(p, dict) and "Converse usage" in p]
-    assert displays == [lab.usage] * 4
+    lab.ns["RUN_PREFIX_CHANGE"] = True
+    execute("low-cache-change", lab.ns)
+    assert len(lab.calls) == 5
+    # One metadata object per answer, preserving native counters and TTL details.
+    displays = [p for p in lab.printed if isinstance(p, dict)]
+    assert len(displays) == 5
+    for metadata, row in zip(displays, lab.ns["RUN_ROWS"], strict=True):
+        assert metadata["api"] == "Converse"
+        assert metadata["model"] == row["model_id"]
+        assert metadata["usage"] == row["response"]["usage"] == lab.usage
+        assert metadata["latency_ms"] == round(row["latency_ms"], 1)
+        assert metadata["stop_reason"] == row["stop_reason"]
+        assert metadata["estimated_cost_usd"] == (
+            round(row["cost_usd"], 8) if row["cost_usd"] is not None else None
+        )
+        if retry_attempts:
+            assert metadata["estimated_cost_usd"] is None
+            assert row["price_note"] in lab.printed
+    questions = lab.ns["cache_questions"]
+    assert [p for p in lab.printed if isinstance(p, str) and p.startswith("\nQuestion:")] == [
+        f"\nQuestion: {question}\nbilling" for question in questions * 2 + questions[:1]
+    ]
     assert all(row["cache_read_tokens"] == 80 and row["cache_write_tokens"] == 20
                and row["cache_write_by_ttl"] == {"5m": 20} for row in lab.ns["RUN_ROWS"])
     assert lab.calls[3]["messages"][1] == lab.ns["RUN_ROWS"][2]["response"]["output"]["message"]
+    assert lab.calls[0]["system"] == lab.calls[1]["system"]
+    assert lab.calls[4]["system"][0]["text"].startswith("Reference edition 2.")
 
 
 @pytest.fixture
@@ -404,7 +428,8 @@ def evaluation(lab):
                 )
             )),
         ),
-        OBS=SimpleNamespace(flush=lambda: flushes.append(True) or True),
+        OBS=SimpleNamespace(flush=lambda: flushes.append(True) or True, backend="agentcore",
+                            region="us-east-1", service_name="playbook-low"),
     )
     return SimpleNamespace(lab=lab, requests=requests, response=response, results=results,
                            members=members, flushes=flushes, row=row, session_id=session_id)
@@ -429,6 +454,22 @@ def test_inline_evaluate_targets_existing_response_and_keeps_judge_usage_separat
     assert evaluation.row["input_tokens"] == 100 and evaluation.row["output_tokens"] == 10
     assert evaluation.results in evaluation.lab.printed
     assert evaluation.flushes == [True]
+
+
+@pytest.mark.parametrize("backend", ["agentcore", "both", "langfuse", "none"])
+def test_low_console_link_opens_the_service_page_without_running_evaluation(evaluation, backend):
+    evaluation.lab.ns["RUN_EVAL"] = False
+    evaluation.lab.ns["OBS"].backend = backend
+    execute("low-24-098e0e64", evaluation.lab.ns)
+    assert not evaluation.requests and evaluation.flushes == [True]
+    if backend in {"agentcore", "both"}:
+        assert evaluation.lab.displayed[-1].data == (
+            "[Open playbook-low in CloudWatch GenAI Observability]"
+            "(https://us-east-1.console.aws.amazon.com/cloudwatch/home?region=us-east-1"
+            "#gen-ai-observability/agent-core/agent/playbook-low?serviceName=playbook-low&source=agents)"
+        )
+    else:
+        assert not evaluation.lab.displayed
 
 
 @pytest.mark.parametrize("change", ["disabled", "empty", "no_span"])
