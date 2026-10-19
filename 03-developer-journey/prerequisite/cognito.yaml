@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'CloudFormation template for Customer Support System with DynamoDB tables, SSM parameters, and synthetic data'
+Description: 'Customer support workshop Cognito user pool, OAuth clients, groups, and SSM configuration'
 Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
@@ -40,8 +40,6 @@ Resources:
         - email  # <--- Use email as username
       AutoVerifiedAttributes:
         - email  # <--- Auto-verify email if you want to skip confirmation step
-      # LambdaConfig:
-      #   PostConfirmation: !GetAtt PostSignupFunction.Arn
   
   AdminGroup:
     Type: AWS::Cognito::UserPoolGroup
@@ -147,66 +145,6 @@ Resources:
         - ''
         - - !Ref 'AWS::Region'
           - !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
-  
-  PostSignupFunctionRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: AllowBasicLogs
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource: arn:aws:logs:*:*:*
-        - PolicyName: Cognito
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - cognito-idp:AdminAddUserToGroup
-                Resource: "*"
-
-  PostSignupFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      Handler: index.lambda_handler
-      Runtime: python3.13
-      Role: !GetAtt PostSignupFunctionRole.Arn
-      Timeout: 10
-      Code:
-        ZipFile: |
-          import boto3
-
-          def lambda_handler(event, context):
-              user_pool_id = event['userPoolId']
-              username = event['userName']
-              client = boto3.client('cognito-idp')
-
-              # Add user to 'customer' group
-              try:
-                  client.admin_add_user_to_group(
-                      UserPoolId=user_pool_id,
-                      Username=username,
-                      GroupName='Customer'
-                  )
-                  print(f"User {username} added to 'customer' group.")
-              except Exception as e:
-                  print(f"Error adding user to group: {e}")
-
-              return event
-
   
   CognitoMachineClientIdParameter:
     Type: AWS::SSM::Parameter

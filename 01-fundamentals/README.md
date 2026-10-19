@@ -1,35 +1,38 @@
 # Part 1: Fundamentals
 
-This section gets your environment ready and gives you the vocabulary every later section assumes — token economics, latency metrics, and observability.
+This section introduces token economics, model APIs, observability, and a first quality evaluation. Start with AWS-native telemetry and AgentCore Evaluations. Langfuse is provisioned up front and ready as an alternative or fallback for trace inspection.
 
 ## Learning Objectives
 
 After completing this section, you will:
-- Be comfortable navigating Jupyter notebooks (kernels, cells, shortcuts)
-- Understand tokens, pricing models, and throughput limits (TPM/RPM)
-- Use the CountTokens API for accurate token estimation
-- Use the Converse API and the Bedrock Mantle endpoint
-- Trace LLM calls and costs in Langfuse
+
+- Be comfortable navigating Jupyter notebooks (kernels, cells, shortcuts; optional orientation)
+- Understand token pricing and throughput limits (TPM/RPM)
+- Use CountTokens where supported by the selected model/API
+- Compare Converse and optional provider-specific APIs using explicit capability checks
+- Capture local model spans, reconcile usage and cost, and run a first AgentCore evaluation
 
 ## Notebooks
 
-| Notebook | Duration | Description |
-|----------|----------|-------------|
-| [00-jupyter-notebook-101](./00-jupyter-notebook-101.ipynb) | 15 min | Kernels, cells, shortcuts, first Bedrock call — workshop tooling onboarding |
-| [01-prompts-101](./01-prompts-101.ipynb) | 30 min | Tokens, pricing, TPM/RPM, CRIS, Converse API, Bedrock Mantle |
-| [02-langfuse-observability](./02-langfuse-observability.ipynb) | 15 min | LLM tracing, cost tracking, production monitoring |
+| Notebook | Description |
+| --- | --- |
+| [00-jupyter-notebook-101](./00-jupyter-notebook-101.ipynb) | Optional tooling introduction: kernels, cells, shortcuts, and a first Bedrock call |
+| [01-prompts-101](./01-prompts-101.ipynb) | Tokens, pricing, quotas, inference profiles, and model/API capabilities |
+| [02-observability-and-evaluation](./02-observability-and-evaluation.ipynb) | AWS-native traces, usage accounting, and an initial response evaluation |
+
+Use the [Workshop Studio agenda](https://catalog.us-east-1.prod.workshops.aws/workshops/60d21a0a-c56f-47aa-9e5d-45181cd42507/en-US) for durations and track choices.
 
 ## Prerequisites
 
-- AWS Account with Amazon Bedrock access
-- Python 3.10+
-- `.env` file with AWS credentials (see root `.env.example`)
+- The provisioned Code Editor with **Bedrock Workshop (Python 3.13)** selected. For an optional local environment, run `uv sync --frozen --python 3.13 --extra notebook --extra langfuse` from the root, as described in the [repository setup](../README.md).
+- AWS credentials through the configured credential chain, access to the selected Bedrock model/API, and the telemetry/evaluation prerequisites for the chosen exercise.
+- A fresh notebook kernel. The default backend is `agentcore`. To use the provisioned Langfuse alternative, follow **Langfuse Project Setup** in your workshop guide to create project API keys, save the connection settings, and select `langfuse` or `both` before restarting the kernel. No additional install is needed.
 
 ## Key Metrics Covered
 
 | Metric | Description |
 |--------|-------------|
-| **Accuracy** | Response correctness (LLM-as-judge, human eval) |
-| **Cost** | Token costs (input, output, cache) |
-| **Latency** | TTFT, TTLT, generation time |
+| **Quality** | Response correctness against authored references; local response checks do not prove remote tool behavior |
+| **Cost** | Uncached input, cache writes/reads, and output; report evaluator and infrastructure charges separately |
+| **Latency** | End-to-end duration; TTFT only where streaming is explicitly measured |
 | **Throughput** | TPM, RPM |

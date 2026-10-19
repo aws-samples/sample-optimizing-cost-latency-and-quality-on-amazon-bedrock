@@ -1,172 +1,188 @@
-# Makefile for Prompt Optimization Workshop Infrastructure
-# Reads from .env file, overriding any shell environment variables
+# Self-paced deployment uses the same templates as Workshop Studio.
+# Core infrastructure builds its own Lambda code and pinned SDK layers.
+# Read Metadata.WorkshopMigration in prerequisite/infrastructure.yaml before
+# upgrading an existing stack that used the legacy custom-resource templates.
+# Optional ../.env values override shell variables; command-line make values win.
+# No AWS command is evaluated while parsing this file, including during make -n.
+-include ../.env
 
-# Load .env file from project root and export variables (overriding existing env vars)
-ifneq (,$(wildcard ../.env))
-    include ../.env
-    export $(shell sed 's/=.*//' ../.env | grep -v '^\#' | grep -v '^$$')
+SHELL := /bin/sh
+.DEFAULT_GOAL := help
+export AWS_PAGER :=
+
+# Empty profile uses the normal AWS credential chain. Exporting AWS_PROFILE=""
+# would make the CLI look for a profile with an empty name, so pass it only as an
+# explicit CLI option when nonempty. Inherited credential variables still work.
+AWS_PROFILE ?=
+ifneq ($(strip $(AWS_PROFILE)),)
+export AWS_PROFILE
+else
+unexport AWS_PROFILE
 endif
+AWS_REGION ?= $(if $(AWS_DEFAULT_REGION),$(AWS_DEFAULT_REGION),us-east-1)
+AWS ?= aws
+AWS_CLI = $(AWS) --region "$(AWS_REGION)" $(if $(strip $(AWS_PROFILE)),--profile "$(AWS_PROFILE)",)
 
-# Disable AWS CLI pager (prevents requiring 'q' to exit)
-export AWS_PAGER=
-
-# Default values (used only if not set in .env)
-AWS_REGION ?= us-east-1
-INFRA_STACK_NAME ?= prompt-workshop-infra
 COGNITO_STACK_NAME ?= prompt-workshop-cognito
-LAMBDA_S3_BUCKET ?= $(shell AWS_PROFILE=$(AWS_PROFILE) aws sts get-caller-identity --query Account --output text)-$(AWS_REGION)-workshop-lambda
+INFRA_STACK_NAME ?= prompt-workshop-infra
+LANGFUSE_STACK_NAME ?= prompt-workshop-langfuse
+CODE_EDITOR_STACK_NAME ?= prompt-workshop-code-editor
+GATE_STACK_NAME ?= prompt-workshop-gate
+# Maintainers may select a published branch, tag or commit; participants use main.
+CODE_EDITOR_REPO_REF ?= main
+# Leave empty to create/reuse <account>-<region>-workshop-cfn-templates.
+# A supplied bucket must already exist in the caller's account. Existing buckets
+# are never reconfigured, emptied or deleted by this Makefile.
+CFN_S3_BUCKET ?=
+CFN_S3_PREFIX ?= workshop-templates/$(INFRA_STACK_NAME)
+RUNTIME_RESOURCES_CLEANED ?= 0
 
-.PHONY: help deploy-all deploy-infra deploy-cognito delete-all delete-infra delete-cognito status check-env package-lambda create-bucket
+# Resolve account-dependent defaults only when a recipe actually runs.
+define resolve_template_bucket
+account=$$($(AWS_CLI) sts get-caller-identity --query Account --output text); \
+case "$$account" in ''|*[!0-9]*) echo "Invalid AWS account ID" >&2; exit 1;; esac; \
+test "$${#account}" -eq 12 || { echo "Invalid AWS account ID" >&2; exit 1; }; \
+bucket="$(CFN_S3_BUCKET)"; \
+if [ -z "$$bucket" ]; then bucket="$$account-$(AWS_REGION)-workshop-cfn-templates"; fi; \
+case "$(CFN_S3_PREFIX)" in ''|/|/*) echo "CFN_S3_PREFIX must be a non-empty relative template prefix" >&2; exit 1;; esac
+endef
+
+.PHONY: help check-env prepare-template-bucket create-bucket \
+	deploy-all deploy-cognito deploy-infra deploy-langfuse deploy-code-editor deploy-gate \
+	check-runtime-cleanup delete-all delete-gate delete-code-editor delete-langfuse delete-infra delete-cognito \
+	status status-cognito status-infra status-langfuse status-code-editor status-gate
 
 help:
-	@echo "Prompt Optimization Workshop - Infrastructure Deployment"
+	@echo "Self-paced workshop infrastructure"
+	@echo "  make deploy-all       Deploy Cognito -> core -> Langfuse -> CodeEditor -> prompt quality gate"
+	@echo "  make deploy-cognito   Deploy only Cognito"
+	@echo "  make deploy-infra     Deploy only core (Cognito should already exist)"
+	@echo "  make deploy-langfuse  Deploy Langfuse for the comparison labs"
+	@echo "  make deploy-code-editor Deploy CodeEditor with the full workshop dependencies"
+	@echo "  make deploy-gate      Deploy only the prompt quality gate"
+	@echo "  make status           Show all five stack statuses"
+	@echo "  make status-cognito / status-infra / status-langfuse / status-code-editor / status-gate"
+	@echo "                        Show an individual stack status"
+	@echo "  make delete-all       Delete gate -> CodeEditor -> Langfuse -> core -> Cognito"
+	@echo "  make delete-gate / delete-code-editor / delete-langfuse / delete-infra / delete-cognito"
+	@echo "                        Delete an individual stack (cleanup guard applies)"
+	@echo "  make check-env        Verify the selected AWS identity and region"
+	@echo "  make -n deploy-all    Preview commands without making AWS calls"
 	@echo ""
-	@echo "Usage:"
-	@echo "  make deploy-all      Deploy all infrastructure (package, upload, infra, cognito)"
-	@echo "  make deploy-infra    Deploy Lambda, S3, Knowledge Base"
-	@echo "  make deploy-cognito  Deploy Cognito User Pool"
-	@echo "  make package-lambda  Package Lambda code and layer"
-	@echo "  make delete-all      Delete all infrastructure"
-	@echo "  make delete-infra    Delete infrastructure stack"
-	@echo "  make delete-cognito  Delete Cognito stack"
-	@echo "  make status          Show stack status"
-	@echo "  make check-env       Verify environment configuration"
+	@echo "All five stacks are provisioned up front; AWS-native telemetry remains the default."
+	@echo "CodeEditor source: CODE_EDITOR_REPO_REF=$(CODE_EDITOR_REPO_REF) (default: main)."
+	@echo "AWS_PROFILE is optional; default credentials are used when it is empty."
+	@echo "AWS_REGION=$(AWS_REGION)"
+	@echo "Set CFN_S3_BUCKET to reuse a bucket; uploads use $(CFN_S3_PREFIX)/."
+	@echo "The template upload bucket and its objects are preserved on stack deletion."
 	@echo ""
-	@echo "Environment (from .env):"
-	@echo "  AWS_PROFILE:         $(AWS_PROFILE)"
-	@echo "  AWS_REGION:          $(AWS_REGION)"
-	@echo "  INFRA_STACK_NAME:    $(INFRA_STACK_NAME)"
-	@echo "  COGNITO_STACK_NAME:  $(COGNITO_STACK_NAME)"
+	@echo "First clean up recorded notebook A/B tests, evaluations, targets, Gateways,"
+	@echo "Runtimes, artifacts and guardrails; wait for asynchronous deletion to finish."
+	@echo "Stop active gate builds and batch jobs before deleting their infrastructure."
+	@echo "Then: make delete-all RUNTIME_RESOURCES_CLEANED=1"
 
 check-env:
-	@echo "Checking environment configuration..."
-	@if [ -z "$(AWS_PROFILE)" ]; then \
-		echo "ERROR: AWS_PROFILE not set in .env"; \
-		exit 1; \
+	@test -n "$(AWS_REGION)" || { echo "AWS_REGION must not be empty" >&2; exit 1; }
+	@echo "Verifying AWS credentials in $(AWS_REGION)..."
+	@$(AWS_CLI) sts get-caller-identity
+
+prepare-template-bucket: check-env
+	@set -eu; \
+	$(resolve_template_bucket); \
+	if details=$$($(AWS_CLI) s3api head-bucket --bucket "$$bucket" --expected-bucket-owner "$$account" 2>&1); then \
+		echo "Reusing template bucket $$bucket without changing its configuration"; \
+	else \
+		if [ -n "$(CFN_S3_BUCKET)" ]; then \
+			echo "CFN_S3_BUCKET must already exist and be accessible in account $$account." >&2; \
+			printf '%s\n' "$$details" >&2; exit 1; \
+		fi; \
+		case "$$details" in \
+			*"(404)"*|*"NoSuchBucket"*) ;; \
+			*) printf '%s\n' "$$details" >&2; \
+				echo "Bucket access failed; refusing to create or reconfigure it." >&2; exit 1;; \
+		esac; \
+		echo "Creating template upload bucket $$bucket"; \
+		if [ "$(AWS_REGION)" = "us-east-1" ]; then \
+			$(AWS_CLI) s3api create-bucket --bucket "$$bucket"; \
+		else \
+			$(AWS_CLI) s3api create-bucket --bucket "$$bucket" \
+				--create-bucket-configuration "LocationConstraint=$(AWS_REGION)"; \
+		fi; \
 	fi
-	@echo "AWS_PROFILE: $(AWS_PROFILE)"
-	@echo "AWS_REGION: $(AWS_REGION)"
-	@echo "Verifying AWS credentials..."
-	@AWS_PROFILE=$(AWS_PROFILE) aws sts get-caller-identity --region $(AWS_REGION) || \
-		(echo "ERROR: Invalid AWS credentials for profile $(AWS_PROFILE)"; exit 1)
-	@echo "Environment OK"
 
-create-bucket: check-env
-	@echo "Creating S3 bucket for Lambda code: $(LAMBDA_S3_BUCKET)"
-	@AWS_PROFILE=$(AWS_PROFILE) aws s3api head-bucket --bucket $(LAMBDA_S3_BUCKET) 2>/dev/null || \
-		AWS_PROFILE=$(AWS_PROFILE) aws s3 mb s3://$(LAMBDA_S3_BUCKET) --region $(AWS_REGION)
-	@echo "S3 bucket ready: $(LAMBDA_S3_BUCKET)"
+# Compatibility alias: this prepares templates, not prepackaged Lambda ZIPs.
+create-bucket: prepare-template-bucket
 
-package-lambda: check-env create-bucket
-	@echo "Packaging Lambda code..."
-	@mkdir -p .build
-	@# Package Lambda function code (excluding the pre-packaged layer zip)
-	@cd prerequisite/lambda/python && zip -r ../../../.build/lambda-code.zip . -x "*.pyc" -x "__pycache__/*" -x "ddgs-layer.zip"
-	@echo "Lambda code packaged: .build/lambda-code.zip"
-	@# Use pre-packaged DDGS layer from E2E sample
-	@echo "Using pre-packaged DDGS layer..."
-	@cp prerequisite/lambda/python/ddgs-layer.zip .build/ddgs-layer.zip
-	@echo "DDGS layer ready: .build/ddgs-layer.zip"
-	@# Upload to S3
-	@echo "Uploading to S3..."
-	@AWS_PROFILE=$(AWS_PROFILE) aws s3 cp .build/lambda-code.zip s3://$(LAMBDA_S3_BUCKET)/lambda-code.zip --region $(AWS_REGION)
-	@AWS_PROFILE=$(AWS_PROFILE) aws s3 cp .build/ddgs-layer.zip s3://$(LAMBDA_S3_BUCKET)/ddgs-layer.zip --region $(AWS_REGION)
-	@echo "Lambda artifacts uploaded to s3://$(LAMBDA_S3_BUCKET)/"
+deploy-cognito delete-cognito status-cognito: CFN_STACK = $(COGNITO_STACK_NAME)
+deploy-infra delete-infra status-infra: CFN_STACK = $(INFRA_STACK_NAME)
+deploy-langfuse delete-langfuse status-langfuse: CFN_STACK = $(LANGFUSE_STACK_NAME)
+deploy-code-editor delete-code-editor status-code-editor: CFN_STACK = $(CODE_EDITOR_STACK_NAME)
+deploy-gate delete-gate status-gate: CFN_STACK = $(GATE_STACK_NAME)
+deploy-cognito: CFN_TEMPLATE = cognito.yaml
+deploy-infra: CFN_TEMPLATE = infrastructure.yaml
+deploy-langfuse: CFN_TEMPLATE = langfuse-ecs.yaml
+deploy-code-editor: CFN_TEMPLATE = code-editor.yaml
+deploy-gate: CFN_TEMPLATE = prompt-pipeline.yaml
+# Provision the comparison service from the start while keeping the primary
+# lesson on native telemetry. The canonical CodeEditor template installs the
+# full notebook and Langfuse dependencies independently of telemetry selection.
+deploy-langfuse: CFN_PARAMETERS = --parameter-overrides "DeployLangfuse=true"
+deploy-code-editor: CFN_PARAMETERS = --parameter-overrides \
+	"RepoRef=$(CODE_EDITOR_REPO_REF)" "ObservabilityBackend=agentcore" \
+	"InfrastructureStackName=$(INFRA_STACK_NAME)"
 
-deploy-infra: check-env package-lambda
-	@echo "Deploying infrastructure stack: $(INFRA_STACK_NAME)..."
-	AWS_PROFILE=$(AWS_PROFILE) aws cloudformation deploy \
-		--template-file prerequisite/infrastructure.yaml \
-		--stack-name $(INFRA_STACK_NAME) \
-		--region $(AWS_REGION) \
+deploy-cognito deploy-infra deploy-langfuse deploy-code-editor deploy-gate: prepare-template-bucket
+	@set -eu; \
+	$(resolve_template_bucket); \
+	$(AWS_CLI) cloudformation deploy \
+		--template-file "prerequisite/$(CFN_TEMPLATE)" \
+		--stack-name "$(CFN_STACK)" \
 		--capabilities CAPABILITY_NAMED_IAM \
-		--s3-bucket $(LAMBDA_S3_BUCKET) \
-		--parameter-overrides \
-			LambdaS3Bucket=$(LAMBDA_S3_BUCKET) \
-			LambdaS3Key=lambda-code.zip \
-			LayerS3Key=ddgs-layer.zip \
+		--s3-bucket "$$bucket" --s3-prefix "$(CFN_S3_PREFIX)/$(basename $(CFN_TEMPLATE))" \
+		$(CFN_PARAMETERS) \
 		--no-fail-on-empty-changeset
-	@echo "Infrastructure deployed successfully"
-	@echo ""
-	@echo "Stack outputs:"
-	@AWS_PROFILE=$(AWS_PROFILE) aws cloudformation describe-stacks \
-		--stack-name $(INFRA_STACK_NAME) \
-		--region $(AWS_REGION) \
-		--query 'Stacks[0].Outputs' \
-		--output table
+	@$(AWS_CLI) cloudformation describe-stacks --stack-name "$(CFN_STACK)" \
+		--query 'Stacks[0].Outputs' --output table
 
-deploy-cognito: check-env
-	@echo "Deploying Cognito stack: $(COGNITO_STACK_NAME)..."
-	AWS_PROFILE=$(AWS_PROFILE) aws cloudformation deploy \
-		--template-file prerequisite/cognito.yaml \
-		--stack-name $(COGNITO_STACK_NAME) \
-		--region $(AWS_REGION) \
-		--capabilities CAPABILITY_NAMED_IAM \
-		--no-fail-on-empty-changeset
-	@echo "Cognito deployed successfully"
-	@echo ""
-	@echo "Stack outputs:"
-	@AWS_PROFILE=$(AWS_PROFILE) aws cloudformation describe-stacks \
-		--stack-name $(COGNITO_STACK_NAME) \
-		--region $(AWS_REGION) \
-		--query 'Stacks[0].Outputs' \
-		--output table
+# Recursive recipes preserve order even with make -j. During make -n each child
+# inherits dry-run mode and only prints its AWS commands.
+deploy-all:
+	@$(MAKE) --no-print-directory deploy-cognito
+	@$(MAKE) --no-print-directory deploy-infra
+	@$(MAKE) --no-print-directory deploy-langfuse
+	@$(MAKE) --no-print-directory deploy-code-editor
+	@$(MAKE) --no-print-directory deploy-gate
+	@echo "Cognito, core, Langfuse, CodeEditor and the prompt quality gate are ready."
+	@echo "Start the notebooks with AWS-native telemetry; Langfuse is available for comparison."
 
-deploy-all: deploy-infra deploy-cognito
-	@echo ""
-	@echo "All infrastructure deployed successfully!"
-	@echo ""
-	@echo "Resources created:"
-	@echo "  - Lambda function (web search)"
-	@echo "  - S3 bucket with technical documentation"
-	@echo "  - Bedrock Knowledge Base with S3 Vectors"
-	@echo "  - Cognito User Pool for Gateway authentication"
-	@echo ""
-	@echo "Next steps:"
-	@echo "  1. Run the workshop notebooks in order (01-07)"
+check-runtime-cleanup:
+	@if [ "$(RUNTIME_RESOURCES_CLEANED)" != "1" ]; then \
+		echo "Complete notebook cleanup using saved resource IDs before stack deletion." >&2; \
+		echo "Wait for Runtime/target/evaluation deletion and stop active jobs/builds." >&2; \
+		echo "Keep those records until cleanup finishes; see this journey's README." >&2; \
+		echo "Then rerun with RUNTIME_RESOURCES_CLEANED=1." >&2; exit 1; \
+	fi
 
-delete-infra: check-env
-	@echo "Deleting infrastructure stack: $(INFRA_STACK_NAME)..."
-	AWS_PROFILE=$(AWS_PROFILE) aws cloudformation delete-stack \
-		--stack-name $(INFRA_STACK_NAME) \
-		--region $(AWS_REGION)
-	@echo "Waiting for stack deletion..."
-	AWS_PROFILE=$(AWS_PROFILE) aws cloudformation wait stack-delete-complete \
-		--stack-name $(INFRA_STACK_NAME) \
-		--region $(AWS_REGION)
-	@echo "Infrastructure stack deleted"
+delete-gate delete-code-editor delete-langfuse delete-infra delete-cognito: check-runtime-cleanup check-env
+	$(AWS_CLI) cloudformation delete-stack --stack-name "$(CFN_STACK)"
+	$(AWS_CLI) cloudformation wait stack-delete-complete --stack-name "$(CFN_STACK)"
 
-delete-cognito: check-env
-	@echo "Deleting Cognito stack: $(COGNITO_STACK_NAME)..."
-	AWS_PROFILE=$(AWS_PROFILE) aws cloudformation delete-stack \
-		--stack-name $(COGNITO_STACK_NAME) \
-		--region $(AWS_REGION)
-	@echo "Waiting for stack deletion..."
-	AWS_PROFILE=$(AWS_PROFILE) aws cloudformation wait stack-delete-complete \
-		--stack-name $(COGNITO_STACK_NAME) \
-		--region $(AWS_REGION)
-	@echo "Cognito stack deleted"
+delete-all: check-runtime-cleanup
+	@$(MAKE) --no-print-directory delete-gate
+	@$(MAKE) --no-print-directory delete-code-editor
+	@$(MAKE) --no-print-directory delete-langfuse
+	@$(MAKE) --no-print-directory delete-infra
+	@$(MAKE) --no-print-directory delete-cognito
+	@echo "Stacks deleted. The template upload bucket and prefix are preserved."
+	@echo "Account-level Transaction Search settings are preserved."
 
-delete-all: delete-cognito delete-infra
-	@echo "All infrastructure deleted"
-	@echo "Note: S3 bucket $(LAMBDA_S3_BUCKET) was not deleted. Delete manually if needed."
+status-cognito status-infra status-langfuse status-code-editor status-gate: check-env
+	@$(AWS_CLI) cloudformation describe-stacks --stack-name "$(CFN_STACK)" \
+		--query 'Stacks[0].{Name:StackName,Status:StackStatus,Created:CreationTime}' --output table
 
-status: check-env
-	@echo "Infrastructure Stack Status:"
-	@AWS_PROFILE=$(AWS_PROFILE) aws cloudformation describe-stacks \
-		--stack-name $(INFRA_STACK_NAME) \
-		--region $(AWS_REGION) \
-		--query 'Stacks[0].{Name:StackName,Status:StackStatus,Created:CreationTime}' \
-		--output table 2>/dev/null || echo "  Stack not found: $(INFRA_STACK_NAME)"
-	@echo ""
-	@echo "Cognito Stack Status:"
-	@AWS_PROFILE=$(AWS_PROFILE) aws cloudformation describe-stacks \
-		--stack-name $(COGNITO_STACK_NAME) \
-		--region $(AWS_REGION) \
-		--query 'Stacks[0].{Name:StackName,Status:StackStatus,Created:CreationTime}' \
-		--output table 2>/dev/null || echo "  Stack not found: $(COGNITO_STACK_NAME)"
-
-clean:
-	@echo "Cleaning build artifacts..."
-	@rm -rf .build
-	@echo "Done"
+status:
+	@$(MAKE) --no-print-directory status-cognito
+	@$(MAKE) --no-print-directory status-infra
+	@$(MAKE) --no-print-directory status-langfuse
+	@$(MAKE) --no-print-directory status-code-editor
+	@$(MAKE) --no-print-directory status-gate

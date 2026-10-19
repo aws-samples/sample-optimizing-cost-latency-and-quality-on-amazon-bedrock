@@ -57,8 +57,19 @@ Thumbs.db
 Dockerfile
 .dockerignore
 
-# uv lock file
-uv.lock
+# The refresh lock is committed so event installations resolve the same dependencies.
+.models.json
+.workshop-state/
+.pytest_cache/
+.journey*.json
+.deployment-*.json
+.cleanup*.json
+.gateway-*.json
+.lifecycle*.json
+.preflight-*.json
+.managed-*.json
+.recommendation-*.json
+.replay-*.json
 
 .ruff_cache/
 

@@ -1,0 +1,366 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  AWS-native prompt quality gate. A notebook uploads a versioned source ZIP and an
+  observed candidate replay request, then starts CodeBuild. The build starts and
+  polls AgentCore batch evaluation. No Langfuse credentials or CodeCommit required.
+  Promotion is an explicit notebook operation after offline and online gates.
+
+Parameters:
+  ScoreThreshold:
+    Type: Number
+    Default: 0.7
+    MinValue: 0
+    MaxValue: 1
+    Description: Minimum Correctness average over all held-out cases.
+  MinimumScoredCount:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 500
+    Description: Minimum complete scored cases (use an integer).
+  EvaluationLogGroupPrefix:
+    Type: String
+    Default: /aws/bedrock-agentcore/workshop/
+    AllowedPattern: '[.\-_/#A-Za-z0-9]+/'
+    Description: >-
+      Existing replay source log group prefix, including trailing slash. The
+      notebook must export to groups under this prefix. Change for Runtime replays.
+  BundleNamePrefix:
+    Type: String
+    Default: WorkshopPrompt
+    AllowedPattern: '[A-Za-z][A-Za-z0-9_]{0,80}'
+    Description: Only bundles with this name prefix can be read by the gate.
+
+Resources:
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'techmart-prompt-gate-${AWS::AccountId}-${AWS::Region}'
+      Tags:
+        - Key: Workshop
+          Value: bedrock-prompt-optimization
+        - Key: Purpose
+          Value: prompt-quality-gate
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireWorkshopArtifacts
+            Status: Enabled
+            ExpirationInDays: 30
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt ArtifactBucket.Arn
+              - !Sub '${ArtifactBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+  ArtifactCleanupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EmptyOnlyOwnedGateBucket
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetBucketTagging, s3:ListBucketVersions]
+                Resource: !GetAtt ArtifactBucket.Arn
+              - Effect: Allow
+                Action: s3:DeleteObjectVersion
+                Resource: !Sub '${ArtifactBucket.Arn}/*'
+  ArtifactCleanupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Empty only the tagged stack-owned gate bucket on stack deletion.
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt ArtifactCleanupRole.Arn
+      Timeout: 300
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          import json
+          import urllib.request
+          import boto3
+          from botocore.config import Config
+          from botocore.exceptions import ClientError
+
+          OWNERSHIP = {
+              "Workshop": "bedrock-prompt-optimization",
+              "Purpose": "prompt-quality-gate",
+          }
+
+          def empty_owned_bucket(s3, bucket, owner, context):
+              try:
+                  tags = s3.get_bucket_tagging(Bucket=bucket, ExpectedBucketOwner=owner)["TagSet"]
+              except ClientError as exc:
+                  if exc.response["Error"]["Code"] == "NoSuchBucket":
+                      return
+                  raise
+              actual = {tag["Key"]: tag["Value"] for tag in tags}
+              if any(actual.get(key) != value for key, value in OWNERSHIP.items()):
+                  raise ValueError("Refusing cleanup: gate bucket ownership tags do not match")
+              # Always read the first page again after deleting it. Advancing a
+              # marker while mutating the version listing can skip objects.
+              while context.get_remaining_time_in_millis() > 20000:
+                  page = s3.list_object_versions(Bucket=bucket, ExpectedBucketOwner=owner, MaxKeys=1000)
+                  objects = [{"Key": item["Key"], "VersionId": item["VersionId"]}
+                             for item in page.get("Versions", []) + page.get("DeleteMarkers", [])]
+                  if not objects:
+                      if page.get("IsTruncated"):
+                          raise RuntimeError("Truncated version listing with no deletable entries")
+                      return
+                  result = s3.delete_objects(Bucket=bucket, ExpectedBucketOwner=owner,
+                                              Delete={"Objects": objects, "Quiet": True})
+                  if result.get("Errors"):
+                      raise RuntimeError("S3 version cleanup failed: " + str(result["Errors"]))
+              raise TimeoutError("Bucket cleanup exceeded budget; retry stack deletion to finish")
+
+          def handler(event, context):
+              props = event["ResourceProperties"]
+              bucket = props["BucketName"]
+              status, reason = "SUCCESS", "Owned gate bucket cleanup complete"
+              try:
+                  if event["RequestType"] == "Delete":
+                      s3 = boto3.client("s3", config=Config(connect_timeout=3, read_timeout=10,
+                                                          retries={"total_max_attempts": 2}))
+                      empty_owned_bucket(s3, bucket, props["AccountId"], context)
+              except Exception as exc:
+                  status, reason = "FAILED", str(exc)[:1000]
+              body = json.dumps({
+                  "Status": status, "Reason": reason,
+                  "PhysicalResourceId": event.get("PhysicalResourceId", "owned-gate-bucket:" + bucket),
+                  "StackId": event["StackId"], "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+              }).encode()
+              request = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
+                                               headers={"Content-Type": "", "Content-Length": str(len(body))})
+              with urllib.request.urlopen(request, timeout=15) as response:
+                  response.read()
+  EmptyArtifactBucket:
+    Type: Custom::EmptyOwnedGateBucket
+    Properties:
+      ServiceToken: !GetAtt ArtifactCleanupFunction.Arn
+      ServiceTimeout: 360
+      BucketName: !Ref ArtifactBucket
+      AccountId: !Ref AWS::AccountId
+  BuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 14
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ObservedCandidateGate
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObjectVersion]
+                Resource:
+                  - !Sub '${ArtifactBucket.Arn}/source/*'
+                  - !Sub '${ArtifactBucket.Arn}/requests/*'
+              - Effect: Allow
+                Action: [s3:PutObject]
+                Resource: !Sub '${ArtifactBucket.Arn}/results/*'
+              - Effect: Allow
+                Action: [s3:GetBucketLocation, s3:GetBucketAcl]
+                Resource: !GetAtt ArtifactBucket.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt BuildLogGroup.Arn
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetConfigurationBundle
+                  - bedrock-agentcore:GetConfigurationBundleVersion
+                Resource: !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:configuration-bundle/${BundleNamePrefix}*'
+              # Batch evaluation uses the caller identity, not an execution role.
+              # Official batch-evaluations-prereqs documents batch-evaluate/*.
+              # There are no promotion or model invocation rights.
+              - Effect: Allow
+                Action: [bedrock-agentcore:StartBatchEvaluation, bedrock-agentcore:GetBatchEvaluation]
+                Resource: !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:batch-evaluate/*'
+              - Effect: Allow
+                Action:
+                  - logs:StartQuery
+                  - logs:FilterLogEvents
+                  - logs:GetLogEvents
+                  - logs:DescribeLogStreams
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${EvaluationLogGroupPrefix}*'
+              - Effect: Allow
+                Action: [logs:GetQueryResults, logs:StopQuery, logs:DescribeLogGroups]
+                Resource: '*'
+              # Split Runtime telemetry keeps full spans in this exact shared
+              # group. No write/retention/delete permission on aws/spans.
+              - Effect: Allow
+                Action: [logs:StartQuery, logs:FilterLogEvents, logs:GetLogEvents, logs:DescribeLogStreams]
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans:*'
+  EvaluationProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub 'techmart-prompt-gate-${AWS::Region}'
+      Tags:
+        - Key: Workshop
+          Value: bedrock-prompt-optimization
+        - Key: Purpose
+          Value: prompt-quality-gate
+      Description: Evaluate an immutable candidate against observed held-out replay sessions.
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      TimeoutInMinutes: 15
+      QueuedTimeoutInMinutes: 30
+      ConcurrentBuildLimit: 1
+      Artifacts:
+        Type: S3
+        Location: !Ref ArtifactBucket
+        Path: results
+        NamespaceType: BUILD_ID
+        Name: gate-output.zip
+        Packaging: ZIP
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref BuildLogGroup
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: ARTIFACT_BUCKET
+            Value: !Ref ArtifactBucket
+          - Name: EXPECTED_BUCKET_OWNER
+            Value: !Ref AWS::AccountId
+          - Name: MIN_SCORE
+            Value: !Ref ScoreThreshold
+          - Name: MIN_SCORED_COUNT
+            Value: !Ref MinimumScoredCount
+          - Name: SOURCE_KEY
+            Value: ''
+          - Name: SOURCE_VERSION
+            Value: ''
+          - Name: SOURCE_SHA256
+            Value: ''
+          - Name: REQUEST_KEY
+            Value: ''
+          - Name: REQUEST_VERSION
+            Value: ''
+          - Name: REQUEST_SHA256
+            Value: ''
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                python: 3.12
+              commands:
+                - python -m pip install 'boto3==1.43.101' 'botocore==1.43.101'
+            pre_build:
+              commands:
+                - |
+                  python - <<'PY'
+                  import hashlib, io, os, re, zipfile
+                  from pathlib import Path
+                  import boto3
+                  from botocore.config import Config
+                  s3 = boto3.client('s3', config=Config(connect_timeout=3, read_timeout=30, retries={'total_max_attempts': 2}))
+                  def download(kind, prefix, limit):
+                      key, version, sha = [os.environ[kind + '_' + k] for k in ('KEY', 'VERSION', 'SHA256')]
+                      if not re.fullmatch(prefix + r'/[a-f0-9]{64}\.(zip|json)', key) or not version or version == 'null':
+                          raise ValueError('Missing versioned artifact or invalid input prefix: ' + kind)
+                      if not re.fullmatch(r'[a-f0-9]{64}', sha):
+                          raise ValueError('Missing artifact digest: ' + kind)
+                      obj = s3.get_object(Bucket=os.environ['ARTIFACT_BUCKET'], Key=key, VersionId=version,
+                                          ExpectedBucketOwner=os.environ['EXPECTED_BUCKET_OWNER'])
+                      if obj['ContentLength'] > limit:
+                          raise ValueError('Artifact exceeds size limit')
+                      data = obj['Body'].read(limit + 1)
+                      if len(data) > limit or hashlib.sha256(data).hexdigest() != sha:
+                          raise ValueError('Artifact digest mismatch: ' + kind)
+                      return data
+                  source = download('SOURCE', 'source', 2_000_000)
+                  expected = {'workshop_utils/__init__.py', 'workshop_utils/lifecycle.py', 'scripts/run_agentcore_gate.py'}
+                  with zipfile.ZipFile(io.BytesIO(source)) as z:
+                      if set(z.namelist()) != expected or len(z.infolist()) != len(expected):
+                          raise ValueError('Source ZIP must contain only the three reviewed gate files')
+                      for info in z.infolist():
+                          if info.file_size > 1_000_000:
+                              raise ValueError('Oversized source member')
+                          path = Path(info.filename)
+                          path.parent.mkdir(parents=True, exist_ok=True)
+                          path.write_bytes(z.read(info))
+                  Path('request.json').write_bytes(download('REQUEST', 'requests', 5_000_000))
+                  PY
+            build:
+              commands:
+                - python scripts/run_agentcore_gate.py --request request.json --output evaluation_results.json --min-score "$MIN_SCORE" --min-scored-count "$MIN_SCORED_COUNT" --timeout-s 360
+          artifacts:
+            files:
+              - evaluation_results.json
+              - request.json
+
+Outputs:
+  EvaluationProjectName:
+    Description: Pass this project name to CodeBuild StartBuild from the notebook.
+    Value: !Ref EvaluationProject
+  EvaluationProjectArn:
+    Description: Scope participant StartBuild/BatchGetBuilds permission to this project.
+    Value: !GetAtt EvaluationProject.Arn
+  PipelineName:
+    Description: Compatibility name for the managed quality gate CodeBuild project.
+    Value: !Ref EvaluationProject
+  PipelineUrl:
+    Description: AWS-native quality gate builds and logs.
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/codesuite/codebuild/projects/${EvaluationProject}/history'
+  ArtifactBucketName:
+    Description: Versioned source/, requests/, and results/ artifacts; restrict input writers.
+    Value: !Ref ArtifactBucket
+  ArtifactBucketArn:
+    Description: Scope participant input uploads, version reads and listings to this bucket.
+    Value: !GetAtt ArtifactBucket.Arn
+  CodeBuildRoleArn:
+    Description: Evaluation-only role. No bundle write or promotion rights.
+    Value: !GetAtt CodeBuildRole.Arn
