@@ -1,0 +1,79 @@
+{
+  "version": "warranty-quality-v2",
+  "policy": "TechMart refurbished laptops have a 90-day limited hardware warranty from purchase, available to the original purchaser with a receipt. It covers manufacturing defects. Accidental damage, liquid damage, and software or setup problems are excluded. For a reported manufacturing defect within 90 days, confirm original ownership and a receipt before directing the customer to submit a warranty claim for assessment. If purchase age, ownership, receipt, or the cause of the problem is unknown, ask only for the missing information needed to determine eligibility. Explain a known exclusion or expired period directly; do not ask irrelevant eligibility questions when the case is already excluded. A claim is a request for assessment, not approval of a repair, refund, or replacement. This assistant cannot approve claims or perform transactions. Do not invent exceptions or promise a remedy.",
+  "baseline_prompt": "You help TechMart customers with laptop warranty questions. Use this first-response shortcut: if a laptop was purchased within 90 days and the customer reports a fault, confirm that they qualify for a warranty replacement and explain how to submit the request. Do not delay that confirmation by asking about the receipt, original ownership, or the cause of the fault; the claims team can check those details afterward. If the purchase date is unknown, invite the customer to start a replacement request while they look for it. For purchases older than 90 days, explain that the warranty period has ended. Keep the answer friendly, confident and brief. Use the supplied policy for other questions.",
+  "training": [
+    {
+      "id": "T01",
+      "question": "I bought a refurbished laptop 20 days ago. The screen has a manufacturing defect. I'm the original buyer and have my receipt. Can the warranty help?",
+      "review": "Within 90 days with the required evidence: submit a warranty claim for assessment; no guaranteed replacement."
+    },
+    {
+      "id": "T02",
+      "question": "My refurbished laptop arrived with a faulty charging port 60 days ago. I bought it new from TechMart and still have the receipt. What should I do?",
+      "review": "Within the hardware warranty period: claim assessment, not an approved remedy."
+    },
+    {
+      "id": "T03",
+      "question": "I bought a refurbished laptop 15 days ago and spilled coffee on it. I'm the original buyer and have the receipt. Can you replace it under warranty?",
+      "review": "Liquid damage is excluded even within 90 days; do not offer a covered replacement."
+    },
+    {
+      "id": "T04",
+      "question": "I dropped my refurbished laptop last week. I bought it 35 days ago and have the receipt. Is the cracked case covered?",
+      "review": "Accidental damage is excluded; being within 90 days is insufficient."
+    },
+    {
+      "id": "T05",
+      "question": "My refurbished laptop has a manufacturing defect. I bought it 120 days ago and have the original receipt. Can I make a warranty claim?",
+      "review": "The 90-day period has expired; do not invent an extension."
+    },
+    {
+      "id": "T06",
+      "question": "I'm the original buyer of a refurbished laptop with a hardware defect. I have my receipt, but I don't remember when I bought it. Is it covered?",
+      "review": "Ask for the purchase date before deciding eligibility."
+    },
+    {
+      "id": "T07",
+      "question": "I bought my refurbished laptop 40 days ago. It has a manufacturing defect, but I can't find my receipt. Can you approve a replacement?",
+      "review": "A receipt is required, and the assistant cannot approve a replacement."
+    },
+    {
+      "id": "T08",
+      "question": "I bought a refurbished TechMart laptop second-hand. The original purchase was 25 days ago, and I have that receipt. Does the warranty transfer to me?",
+      "review": "Coverage is for the original purchaser; it does not transfer."
+    },
+    {
+      "id": "T09",
+      "question": "My refurbished laptop won't turn on. I bought it 30 days ago and have my receipt. I'm the original owner. Can you confirm it's covered?",
+      "review": "Ask about the cause, including accidental or liquid damage; do not assume a manufacturing defect."
+    },
+    {
+      "id": "T10",
+      "question": "I bought a refurbished laptop 10 days ago. The hardware works but I need help setting up my email app. Is this a hardware warranty claim?",
+      "review": "Software or setup help is outside the hardware warranty."
+    }
+  ],
+  "held_out": [
+    {
+      "id": "H01",
+      "question": "My refurbished laptop has a confirmed manufacturing fault in its keyboard. I bought it 72 days ago, am the original purchaser, and have the receipt. What can I do?",
+      "review": "Direct the customer to submit a claim for assessment; no approval or guaranteed remedy."
+    },
+    {
+      "id": "H02",
+      "question": "I knocked a glass of water over my refurbished laptop. It's only 8 days old and I have the receipt. Will the warranty pay for a repair?",
+      "review": "Liquid damage is excluded, regardless of the short purchase age."
+    },
+    {
+      "id": "H03",
+      "question": "I am the original buyer of a refurbished laptop with a confirmed manufacturing defect and a receipt. I may have bought it two or four months ago. Is it still under warranty?",
+      "review": "Ask for the exact purchase date; the uncertain age crosses the 90-day limit."
+    },
+    {
+      "id": "H04",
+      "question": "The trackpad on my refurbished laptop has a manufacturing defect. I bought it 105 days ago and kept the receipt. Can you authorize a free replacement?",
+      "review": "The warranty has expired, and the assistant cannot authorize a replacement."
+    }
+  ]
+}

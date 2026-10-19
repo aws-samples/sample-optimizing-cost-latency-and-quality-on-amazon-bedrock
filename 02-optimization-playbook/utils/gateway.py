@@ -30,9 +30,31 @@ def canonical_catalog(target_name: str = "") -> list[dict]:
     return tools
 
 
-def restrict_catalog(definitions: list[dict], target_name: str) -> list[dict]:
+def discovery_catalog(target_name: str = "") -> list[dict]:
+    """Two executable tools plus 30 catalog-only definitions for the search lesson."""
+    catalog = canonical_catalog(target_name)
+    path = Path(__file__).parent.parent / "data" / "gateway-dummy-tools.json"
+    for item in json.loads(path.read_text()):
+        catalog.append({
+            "name": f"{target_name}___{item['name']}" if target_name else item["name"],
+            "description": item["description"],
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    item["argument"]: {"type": "string", "description": item["argument_description"]},
+                },
+                "required": [item["argument"]],
+            },
+        })
+    if len({tool["name"] for tool in catalog}) != len(catalog):
+        raise ValueError("Discovery catalog contains duplicate tool names.")
+    return catalog
+
+
+def restrict_catalog(definitions: list[dict], target_name: str, *, include_dummies: bool = False) -> list[dict]:
     """Exact owned-target names AND schemas; never authorize by suffix or search rank."""
-    trusted = {t["name"]: t for t in canonical_catalog(target_name)}
+    reviewed = discovery_catalog(target_name) if include_dummies else canonical_catalog(target_name)
+    trusted = {t["name"]: t for t in reviewed}
     result = []
     seen = set()
     for definition in definitions:
@@ -159,7 +181,14 @@ def check_tool_task(case: dict, final_row: dict, executions: list[dict], *,
         answer = json.loads(final_row.get("text", ""))
     except (json.JSONDecodeError, TypeError):
         answer = None
-    correct = answer == case["expected"] and isinstance(answer, dict) and answer.get("approved") is False
+    type_mismatches = [
+        key for key, value in case["expected"].items()
+        if isinstance(answer, dict) and key in answer and type(answer[key]) is not type(value)
+    ]
+    correct = (
+        isinstance(answer, dict) and answer == case["expected"]
+        and answer.get("approved") is False and not type_mismatches
+    )
     omissions = sorted(set(expected) - requested)
     missing_results = sorted(set(expected) - succeeded)
     # These cases ask only about the deterministic laptop fixtures. A status=ok
@@ -179,7 +208,8 @@ def check_tool_task(case: dict, final_row: dict, executions: list[dict], *,
         "model_request_omissions": omissions, "missing_successful_results": missing_results,
         "backend_fixture_mismatches": mismatches,
         "unexpected_requests": unexpected, "tool_failures": len(failures),
-        "answer_correct": correct, "complete": final_row.get("stop_reason") == "end_turn",
+        "answer_correct": correct, "field_type_mismatches": type_mismatches,
+        "complete": final_row.get("stop_reason") == "end_turn",
         "passed": correct and final_row.get("stop_reason") == "end_turn"
         and not (omissions or missing_results or mismatches or unexpected or failures),
     }

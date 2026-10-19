@@ -16,11 +16,11 @@ Use the [Workshop Studio agenda](https://catalog.us-east-1.prod.workshops.aws/wo
 
 ## Exercise boundaries
 
-- Context management compares full history, frequent compaction, and size-triggered compaction. Harness engineering compares verbose instructions with an audited, task-scoped version. Enable their live comparisons in the relevant notebook sections.
+- Context management compares full history, frequent compaction, and size-triggered compaction. Harness engineering compares overloaded and task-focused skill, tool and record loading while keeping shared instructions fixed. The notebooks identify optional service calls beside their exercises.
 - Small-model customization is an optional concept overview.
-- The runnable delegation comparison uses Strands. Claude Agent SDK and GEPA/DSPy are optional alternatives, outside the default installed environment.
-- Lever 14 starts with a dataset-based Bedrock Advanced Prompt Optimization (APO) job and a held-out comparison. A single-prompt rewrite and trace-based AgentCore Recommendations are optional extensions; AgentCore Evaluations closes the comparison by checking recorded answers.
-- Managed KB, persistent memory, and Gateway exercises use the resources described in their notebook sections. The Gateway comparison searches a reviewed catalog and can execute read-only product/policy tools; inspect the tool results and final answer as well as selection.
+- The delegation comparison uses two Strands readers in parallel, then a lead agent answers from their selected evidence.
+- Lever 14 starts with a Bedrock Advanced Prompt Optimization (APO) job and a comparison on held-out tickets. A separate optional warranty exercise uses AgentCore Evaluations and Recommendations to diagnose an instruction problem, propose a fix, and compare answers on new cases.
+- Managed KB, persistent memory, and Gateway exercises use the resources described in their notebook sections. Gateway compares all 32 definitions with search followed by a five-tool application cap; only the two product/policy tools execute. Inspect the returned count, loaded definitions, tool results and final answer.
 - At an AWS event, prepare batch inputs with `RUN_BATCH=0` and leave the submission cell commented out. A live batch job is an optional own-account extension requiring both uncommenting the cell and enabling the flag.
 - Keep the task, data, and acceptance rules fixed and change only the lever being tested. Model selection and routing deliberately vary the model; prompt comparisons keep the model/API fixed. Keep unsuccessful or inconclusive outcomes visible.
 
