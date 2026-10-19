@@ -13,10 +13,7 @@ These terms are used across the notebooks, agent implementations and evaluations
 | Held-out split | Separate cases used to evaluate the control and candidate. |
 | Retrieved context | Knowledge Base passages, scores and source locations returned for a support query. |
 | Session and trace | Identifiers that connect an invocation to its model, tool and agent spans. Local and remotely deployed invocations have separate traces. |
-| Configuration bundle | Versioned runtime configuration, including the prompt and tool descriptions consumed by the agent. |
 | Control and candidate | The current configuration and a proposed change evaluated on the same workload. |
 | Quality gate | A check that requires complete evaluation evidence and the declared score floor before progressing. |
-| A/B experiment | Fresh sessions routed between control and candidate after the offline gate. |
-| Promotion and rollback | Creating a mainline configuration version from the accepted candidate or a selected previous version. |
 
 AWS-native telemetry and AgentCore Evaluations are the primary path. The provisioned Langfuse service provides an alternative for inspecting traces, metrics and prompts. Use the notebook's selected backend and measurement scope when comparing results.

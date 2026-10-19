@@ -21,7 +21,7 @@ Use the [Workshop Studio agenda](https://catalog.us-east-1.prod.workshops.aws/wo
 - The delegation comparison uses two Strands readers in parallel, then a lead agent answers from their selected evidence.
 - Lever 14 starts with a Bedrock Advanced Prompt Optimization (APO) job and a comparison on held-out tickets. A separate optional warranty exercise uses AgentCore Evaluations and Recommendations to diagnose an instruction problem, propose a fix, and compare answers on new cases.
 - Managed KB, persistent memory, and Gateway exercises use the resources described in their notebook sections. Gateway compares all 32 definitions with search followed by a five-tool application cap; only the two product/policy tools execute. Inspect the returned count, loaded definitions, tool results and final answer.
-- At an AWS event, prepare batch inputs with `RUN_BATCH=0` and leave the submission cell commented out. A live batch job is an optional own-account extension requiring both uncommenting the cell and enabling the flag.
+- At an AWS event, run batch input preparation and leave the submission cell commented out. For an eligible own-account run, uncomment the submission cell and set `RUN_BATCH=True`.
 - Keep the task, data, and acceptance rules fixed and change only the lever being tested. Model selection and routing deliberately vary the model; prompt comparisons keep the model/API fixed. Keep unsuccessful or inconclusive outcomes visible.
 
 ## Prerequisites

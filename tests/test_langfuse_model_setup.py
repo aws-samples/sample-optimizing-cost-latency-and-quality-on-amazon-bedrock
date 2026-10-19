@@ -169,7 +169,9 @@ def test_defaults_are_all_six_exact_global_profiles_with_all_registry_cache_pric
 
 
 @pytest.mark.parametrize("filename,setting", [
-    ("03-high-effort.ipynb", "OPTIMIZE_INFERENCE_MODEL"),
+    ("03-high-effort.ipynb", "APO_MODEL_ID"),
+    ("03-high-effort.ipynb", "RECOMMENDATION_MODEL"),
+    ("03-high-effort.ipynb", "WARRANTY_JUDGE_MODEL"),
     ("02-medium-effort.ipynb", "CONTEXT_MODEL"),
 ])
 def test_defaults_cover_explicit_comparison_models(filename, setting):

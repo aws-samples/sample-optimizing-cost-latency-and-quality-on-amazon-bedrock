@@ -20,14 +20,14 @@ Keep the task and evaluation rules fixed, and change only the lever being tested
 
 ## Workshop path
 
-Start with AWS-native observability and AgentCore evaluation. **Langfuse is provisioned up front and available as an alternative or fallback**, with its client already installed.
+Fundamentals and the Optimization Playbook start with AWS-native observability and AgentCore evaluation. **Langfuse is provisioned up front**, with its client already installed. Developer Journey Labs 1–7 use Langfuse and require its project setup.
 
 | Track | Notebooks | Focus |
 | --- | --- | --- |
 | Fundamentals | [01-fundamentals](01-fundamentals/) | Tokens, APIs, pricing, traces, and a first evaluation |
 | Optimization Playbook | [02-optimization-playbook](02-optimization-playbook/) | 16 levers: five LOW, six MEDIUM, and five HIGH effort |
-| Developer Journey | [03-developer-journey](03-developer-journey/) | TechMart agent versions, held-out evaluation, and optimization from traces |
-| Optional deep dives | [04-deep-dive-topics](04-deep-dive-topics/) | Advanced caching and managed prompt lifecycle |
+| Developer Journey | [03-developer-journey](03-developer-journey/) | TechMart agent versions v1–v6, Langfuse traces and quality comparisons |
+| Optional deep dives | [04-deep-dive-topics](04-deep-dive-topics/) | Advanced caching, prompt versioning and evaluation |
 | Cleanup | [99-cleanup](99-cleanup.ipynb) | Review and remove resources recorded for your run |
 
 Model calls, evaluation, and managed resources incur charges. Optional paid exercises are labelled and have explicit controls. An interrupted notebook or polling timeout does not cancel a server-side job; keep resource records for cleanup.
@@ -91,9 +91,9 @@ OBSERVABILITY_BACKEND=langfuse
 
 Use `both` to export to AWS and Langfuse together. **Restart the kernel and run from the top; no additional installation is needed.** Notebook setup honors this backend choice over Code Editor's default while retaining supplied AWS credentials. Configure telemetry before creating instrumented clients. Find the same session/trace IDs in the selected backend.
 
-The backend setting selects trace export. AWS managed evaluation and promotion exercises still use AgentCore APIs; Langfuse trace views and prompt labels do not replace those gates. The workshop Langfuse server is v3: SDK v4 supports ingestion, while its newer observation/metrics read APIs require server v4. Use the documented v3-compatible reads.
+The backend setting selects trace export for Fundamentals and the Playbook. Their managed optimization and evaluation exercises still call Bedrock and AgentCore regardless of the trace destination. The workshop Langfuse server is v3: SDK v4 supports ingestion, while its newer observation/metrics read APIs require server v4. Use the documented v3-compatible reads.
 
-Developer Journey deployments have a separate `RUNTIME_BACKEND` setting and build locked Linux ARM64 artifacts using the provisioned execution role and artifact bucket.
+Developer Journey Labs 1–7 use their own Langfuse telemetry setup and Sonnet 4.6/Haiku 4.5 configuration. Follow those notebooks' setup instructions and use a fresh kernel before changing sections.
 
 ## Finish and clean up
 
@@ -115,10 +115,10 @@ Helpers specific to a lesson live in that section's `utils/` directory:
 | --- | --- |
 | Fundamentals | Introductory pricing and Langfuse convenience functions |
 | Optimization Playbook | Support tools, cache metrics and Gateway result parsing |
-| Developer Journey | Agent configuration, deployment packaging, Gateway setup, evaluation workflow and resource cleanup |
-| Deep Dives | Langfuse text-dataset compatibility used by the lifecycle notebook and evaluation script |
+| Developer Journey | Agent configuration, Runtime helpers, support tools, Langfuse metrics, evaluation and resource cleanup |
+| Deep Dives | Cache measurement, pricing and prompt-evaluation helpers |
 
-`workshop_utils/` holds the implementations used across sections: model capabilities and selection, pricing and request validation, telemetry and metrics, evaluation and trace collection, retrieval, and the managed lifecycle gates. These remain shared so the Playbook, Journey and deep dives use the same accounting and API behavior. The notebooks show the lesson's requests and settings; helper code handles repeated setup, serialization, polling and validation.
+`workshop_utils/` contains shared model capabilities, request validation, pricing, telemetry, metrics, pacing and evaluation helpers used by Fundamentals and the Optimization Playbook. The other sections also retain their own utilities. The notebooks show the lesson's requests and settings; helpers handle repeated setup and validation.
 
 ## License
 
