@@ -1262,6 +1262,24 @@ Resources:
                 # Editor marketplace is unverified, so failure must not abort bootstrap.
                 # The Claude Code CLI is already installed by InstallClaudeCode regardless.
                 - !Sub sudo -i -u ${CodeEditorUser} code-editor-server --install-extension anthropic.claude-code --force || echo "claude-code extension unavailable, CLI still installed"
+          - name: CheckWorkshopModelReadiness
+            action: aws:runShellScript
+            inputs:
+              timeoutSeconds: 900
+              runCommand:
+                - '#!/bin/bash'
+                - set -euo pipefail
+                - !Sub |
+                  if [[ -z "${RepoUrl}" && -z "${RepoArchiveBucket}" ]]; then
+                    exit 0
+                  fi
+                  # Run as the participant with the instance role. Small billable
+                  # setup probes activate each API before the first notebook.
+                  cd "${HomeFolder}"
+                  sudo -H -u ${CodeEditorUser} "${HomeFolder}/.venv/bin/python" \
+                    -m workshop_utils.readiness --region "${AWS::Region}" \
+                    --timeout 600 --interval 30 \
+                    --report "${HomeFolder}/.workshop-readiness.json"
 # Install optional packages here - any of these blocks can be deleted if that software is not required for the workshop
 # Install Workshop specific packages here
 
@@ -1578,6 +1596,10 @@ Resources:
                   - cognito-idp:SignUp
                   - cognito-idp:ConfirmSignUp
                 Resource: '*'
+              - Sid: WorkshopGatewayConfiguration
+                Effect: Allow
+                Action: lambda:UpdateFunctionConfiguration
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:workshop-gateway-tools'
               - Sid: CloudFormationReadAccess
                 Effect: Allow
                 Action:
@@ -2096,7 +2118,7 @@ Resources:
       Handler: index.lambda_handler
       Runtime: python3.13
       MemorySize: 128
-      Timeout: 600
+      Timeout: 900
       Environment:
         Variables:
           RetrySleep: 2900
@@ -2206,7 +2228,7 @@ Resources:
     DependsOn: Healthcheck
     Properties:
       ServiceToken: !GetAtt CheckSSMDocLambda.Arn
-      ServiceTimeout: 610
+      ServiceTimeout: 910
       InstanceId: !Ref CodeEditorInstance
       DocumentName: !Ref CodeEditorSSMDoc
 

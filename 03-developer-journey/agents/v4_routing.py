@@ -15,10 +15,17 @@ from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from opentelemetry import trace
 from strands import Agent
 from strands.models import BedrockModel
-from strands.telemetry import StrandsTelemetry
 from strands.types.content import SystemContentBlock
 
-from utils.agent_config import MODEL_HAIKU, MODEL_SONNET, SYSTEM_PROMPT_TEXT, setup_langfuse_telemetry
+from utils.agent_config import (
+    MODEL_HAIKU,
+    MODEL_SONNET,
+    SYSTEM_PROMPT_TEXT,
+    assistant_text,
+    model_settings,
+    setup_langfuse_telemetry,
+)
+from utils.langfuse_setup import current_session_id
 from utils.tools import get_product_info, get_return_policy, get_technical_support, web_search
 
 setup_langfuse_telemetry()
@@ -77,7 +84,7 @@ def classify_query_with_llm(query: str, region: str) -> str:
     """
     classifier_model = BedrockModel(
         model_id=MODEL_HAIKU,
-        temperature=0,
+        **model_settings(MODEL_HAIKU, 0),
         max_tokens=50,
         region_name=region,
     )
@@ -86,6 +93,7 @@ def classify_query_with_llm(query: str, region: str) -> str:
         system_prompt=CLASSIFIER_PROMPT,
         name="customer-support-v4-classifier",
         trace_attributes={
+            "session.id": current_session_id(),
             "version": "v4-routing",
             "component": "classifier",
             "langfuse.tags": ["routing", "classifier"],
@@ -93,7 +101,7 @@ def classify_query_with_llm(query: str, region: str) -> str:
     )
     try:
         result = classifier(query)
-        response_text = result.message["content"][0]["text"].strip().lower()
+        response_text = assistant_text(result).strip().lower()
     except Exception:
         return "complex"
 
@@ -103,9 +111,9 @@ def classify_query_with_llm(query: str, region: str) -> str:
 @app.entrypoint
 def invoke(payload):
     user_input = payload.get("prompt", "")
+    session_id = current_session_id(payload)
 
-    telemetry = StrandsTelemetry()
-    telemetry.setup_otlp_exporter()
+    telemetry = setup_langfuse_telemetry()
 
     tracer = trace.get_tracer("customer-support-v4-routing")
     region = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
@@ -114,6 +122,7 @@ def invoke(payload):
         "customer-support-v4-routing",
         attributes={
             "gen_ai.system": "strands",
+            "session.id": session_id,
             "gen_ai.agent.name": "customer-support-v4-routing",
             "version": "v4-routing",
             "langfuse.observation.input": json.dumps({"prompt": user_input}),
@@ -127,7 +136,7 @@ def invoke(payload):
 
         model = BedrockModel(
             model_id=model_id,
-            temperature=0.1,
+            **model_settings(model_id, 0.1),
             max_tokens=1024,
             cache_tools="default",
             region_name=region,
@@ -139,6 +148,7 @@ def invoke(payload):
             system_prompt=SYSTEM_PROMPT,
             name="customer-support-v4-main",
             trace_attributes={
+                "session.id": session_id,
                 "version": "v4-routing",
                 "query_complexity": complexity,
                 "model_used": model_id,
@@ -147,14 +157,14 @@ def invoke(payload):
         )
 
         response = agent(user_input)
-        response_text = response.message["content"][0]["text"]
+        response_text = assistant_text(response)
 
         parent_span.set_attribute(
             "langfuse.observation.output",
             json.dumps({"response": response_text, "model_used": model_id, "complexity": complexity}),
         )
 
-    telemetry.tracer_provider.force_flush()
+    telemetry.flush()
 
     return {"response": response_text, "model_used": model_id, "complexity": complexity}
 

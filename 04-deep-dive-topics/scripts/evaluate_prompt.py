@@ -29,6 +29,13 @@ import time
 from pathlib import Path
 
 import boto3
+import httpx
+
+try:
+    from langfuse_text_transport import TextDatasetTransport
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from utils.langfuse_text_transport import TextDatasetTransport
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -36,12 +43,8 @@ import boto3
 DATASET_NAME = os.environ.get("EVAL_DATASET_NAME", "customer-support-eval")
 SCORE_THRESHOLD = float(os.environ.get("EVAL_SCORE_THRESHOLD", "0.7"))
 PASS_RATE_THRESHOLD = float(os.environ.get("EVAL_PASS_RATE_THRESHOLD", "0.8"))
-MODEL_ID = os.environ.get(
-    "EVAL_MODEL_ID", "global.anthropic.claude-sonnet-4-6"
-)
-JUDGE_MODEL_ID = os.environ.get(
-    "EVAL_JUDGE_MODEL_ID", "global.anthropic.claude-haiku-4-5-20251001-v1:0"
-)
+MODEL_ID = os.environ.get("EVAL_MODEL_ID", "global.anthropic.claude-sonnet-5")
+JUDGE_MODEL_ID = os.environ.get("EVAL_JUDGE_MODEL_ID", "global.anthropic.claude-opus-5")
 REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 PROMPT_NAME = os.environ.get("EVAL_PROMPT_NAME", "customer-support-system")
 PROMPT_LABEL = os.environ.get("EVAL_PROMPT_LABEL", "draft")
@@ -50,6 +53,7 @@ PROMPT_LABEL = os.environ.get("EVAL_PROMPT_LABEL", "draft")
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _init_langfuse():
     """Return a Langfuse client or None if credentials are missing."""
@@ -61,15 +65,31 @@ def _init_langfuse():
         host = os.environ.get("LANGFUSE_BASE_URL", "https://cloud.langfuse.com")
 
         if not public_key or not secret_key:
-            print(
-                "[ERROR] LANGFUSE_PUBLIC_KEY or LANGFUSE_SECRET_KEY not set."
-            )
+            print("[ERROR] LANGFUSE_PUBLIC_KEY or LANGFUSE_SECRET_KEY not set.")
             return None
 
-        return Langfuse(public_key=public_key, secret_key=secret_key, host=host)
+        return Langfuse(
+            public_key=public_key,
+            secret_key=secret_key,
+            host=host,
+            httpx_client=httpx.Client(transport=TextDatasetTransport(host), timeout=30),
+        )
     except ImportError:
         print("[ERROR] langfuse package not installed.")
         return None
+
+
+def _inference_config(model, max_tokens):
+    config = {"maxTokens": max_tokens}
+    if "claude-sonnet-5" not in model and "claude-opus-5" not in model:
+        config["temperature"] = 0.0
+    return config
+
+
+def _reasoning_config(model):
+    if "claude-sonnet-5" in model or "claude-opus-5" in model:
+        return {"additionalModelRequestFields": {"output_config": {"effort": "low"}}}
+    return {}
 
 
 def _call_agent(query: str, system_prompt: str, bedrock_client) -> dict:
@@ -78,11 +98,14 @@ def _call_agent(query: str, system_prompt: str, bedrock_client) -> dict:
         modelId=MODEL_ID,
         system=[{"text": system_prompt}],
         messages=[{"role": "user", "content": [{"text": query}]}],
-        inferenceConfig={"maxTokens": 500, "temperature": 0.0},
+        inferenceConfig=_inference_config(MODEL_ID, 500),
+        **_reasoning_config(MODEL_ID),
     )
+    if response["stopReason"] != "end_turn":
+        raise RuntimeError(f"Incomplete model answer: {response['stopReason']}")
     usage = response["usage"]
     return {
-        "text": response["output"]["message"]["content"][0]["text"],
+        "text": "".join(b["text"] for b in response["output"]["message"]["content"] if "text" in b),
         "input_tokens": usage["inputTokens"],
         "output_tokens": usage["outputTokens"],
     }
@@ -101,7 +124,7 @@ def _calculate_keyword_score(response: str, expected: dict) -> float:
 
     if "should_use_tool" in expected:
         checks += 1
-        if expected["should_use_tool"].lower() in response.lower():
+        if expected["should_use_tool"].replace("_", " ").lower() in response.lower():
             score += 1
 
     return score / checks if checks > 0 else 1.0
@@ -127,9 +150,12 @@ Return ONLY a JSON object: {{"score": <number>, "reason": "<one sentence>"}}"""
         judge_response = bedrock_client.converse(
             modelId=JUDGE_MODEL_ID,
             messages=[{"role": "user", "content": [{"text": eval_prompt}]}],
-            inferenceConfig={"maxTokens": 300, "temperature": 0.0},
+            inferenceConfig=_inference_config(JUDGE_MODEL_ID, 300),
+            **_reasoning_config(JUDGE_MODEL_ID),
         )
-        raw = judge_response["output"]["message"]["content"][0]["text"].strip()
+        if judge_response["stopReason"] != "end_turn":
+            raise RuntimeError(f"Incomplete judge answer: {judge_response['stopReason']}")
+        raw = "".join(b["text"] for b in judge_response["output"]["message"]["content"] if "text" in b).strip()
 
         try:
             parsed = json.loads(raw)
@@ -152,6 +178,7 @@ Return ONLY a JSON object: {{"score": <number>, "reason": "<one sentence>"}}"""
 # Main evaluation pipeline
 # ---------------------------------------------------------------------------
 
+
 def run_evaluation() -> dict:
     """Run the full evaluation pipeline using dataset.run_experiment()."""
     from langfuse import Evaluation
@@ -161,20 +188,21 @@ def run_evaluation() -> dict:
 
     if langfuse is None:
         return {
-            "total": 0, "successful": 0, "failed": 0,
-            "avg_score": 0.0, "pass_rate": 0.0,
+            "total": 0,
+            "successful": 0,
+            "failed": 0,
+            "avg_score": 0.0,
+            "pass_rate": 0.0,
         }
 
     # Fetch the prompt under test from Langfuse (default: "draft" label)
     prompt_obj = langfuse.get_prompt(PROMPT_NAME, label=PROMPT_LABEL)
     system_prompt = prompt_obj.compile()
-    model_config = prompt_obj.config
     print(f"Evaluating prompt: {PROMPT_NAME} (v{prompt_obj.version}, label={PROMPT_LABEL})")
     print(f"  Text: {system_prompt[:80]}...")
 
     langfuse_dataset = langfuse.get_dataset(name=DATASET_NAME)
-    print(f"Loaded dataset '{DATASET_NAME}' from Langfuse "
-          f"({len(langfuse_dataset.items)} items)")
+    print(f"Loaded dataset '{DATASET_NAME}' from Langfuse ({len(langfuse_dataset.items)} items)")
 
     # Collect local results via closure
     results: list[dict] = []
@@ -188,9 +216,6 @@ def run_evaluation() -> dict:
         expected = item.expected_output or {}
         item_id = (item.metadata or {}).get("id", f"item-{len(results)}")
 
-        agent_result = _call_agent(query, system_prompt, bedrock)
-        agent_response = agent_result["text"]
-
         # Report model usage to Langfuse for cost tracking
         with langfuse.start_as_current_observation(
             as_type="generation",
@@ -198,9 +223,11 @@ def run_evaluation() -> dict:
             model=MODEL_ID,
             input=query,
         ) as gen:
+            agent_result = _call_agent(query, system_prompt, bedrock)
+            agent_response = agent_result["text"]
             gen.update(
                 output=agent_response,
-                usage={
+                usage_details={
                     "input": agent_result["input_tokens"],
                     "output": agent_result["output_tokens"],
                 },
@@ -211,15 +238,17 @@ def run_evaluation() -> dict:
         judge_result = _evaluate_with_llm_judge(query, agent_response, bedrock)
         judge_score = judge_result["score"]
         combined_score = (keyword_score + judge_score) / 2.0
-        judge_cache[query] = judge_result
+        judge_cache[(query, agent_response)] = judge_result
 
-        results.append({
-            "item_id": item_id,
-            "keyword_score": keyword_score,
-            "judge_score": judge_score,
-            "combined_score": combined_score,
-            "success": True,
-        })
+        results.append(
+            {
+                "item_id": item_id,
+                "keyword_score": keyword_score,
+                "judge_score": judge_score,
+                "combined_score": combined_score,
+                "success": True,
+            }
+        )
         print(f"  [{len(results)}/{len(langfuse_dataset.items)}] {query[:60]}... score={combined_score:.2f}")
         return agent_response
 
@@ -231,7 +260,7 @@ def run_evaluation() -> dict:
 
     def judge_evaluator(*, input, output, **kwargs):
         query = input.get("query", "")
-        cached = judge_cache.get(query)
+        cached = judge_cache.get((query, output))
         if cached:
             return Evaluation(
                 name="helpfulness_llm",
@@ -255,14 +284,14 @@ def run_evaluation() -> dict:
     langfuse.flush()
     time.sleep(1)
 
+    if not langfuse_dataset.items or len(results) != len(langfuse_dataset.items):
+        raise RuntimeError("Incomplete dataset experiment; do not run the quality gate")
+
     # Calculate summary
     successful = [r for r in results if r["success"]]
-    avg_score = (
-        sum(r["combined_score"] for r in successful) / len(successful)
-        if successful
-        else 0.0
-    )
-    pass_rate = len(successful) / len(results) if results else 0.0
+    avg_score = sum(r["combined_score"] for r in successful) / len(successful) if successful else 0.0
+    # Match the notebook: a completed API call is not automatically a quality pass.
+    pass_rate = sum(r["combined_score"] >= 0.5 for r in results) / len(results) if results else 0.0
 
     # Fetch production baseline score from SSM Parameter Store for regression check
     prod_avg_score = None
@@ -278,6 +307,8 @@ def run_evaluation() -> dict:
         print(f"\n  [WARN] Could not fetch production baseline: {e}")
 
     return {
+        "prompt_name": PROMPT_NAME,
+        "prompt_version": prompt_obj.version,
         "total": len(results),
         "successful": len(successful),
         "failed": len(results) - len(successful),
@@ -347,7 +378,7 @@ if __name__ == "__main__":
         print(f"\n  QUALITY GATE PASSED: {msg}")
         sys.exit(0)
     else:
-        print(f"\n  QUALITY GATE FAILED:")
+        print("\n  QUALITY GATE FAILED:")
         for reason in reasons:
             print(f"    - {reason}")
         sys.exit(1)

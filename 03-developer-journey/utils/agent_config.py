@@ -5,32 +5,26 @@ Contains model IDs, system prompts, and common utilities.
 
 from __future__ import annotations
 
-import base64
 import os
 
 
 def setup_langfuse_telemetry():
-    """Configure Langfuse telemetry via OTEL. Call at module load time."""
-    public_key = os.environ.get("LANGFUSE_PUBLIC_KEY")
-    secret_key = os.environ.get("LANGFUSE_SECRET_KEY")
-    host = os.environ.get("LANGFUSE_BASE_URL", "https://cloud.langfuse.com")
-    auth = base64.b64encode(f"{public_key}:{secret_key}".encode()).decode()
+    """Initialize the original Langfuse trace destination once per process."""
+    from utils.langfuse_setup import setup_langfuse
 
-    os.environ["LANGFUSE_PROJECT_NAME"] = "my-llm-project"
-    os.environ["DISABLE_ADOT_OBSERVABILITY"] = "true"
-    os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = f"{host}/api/public/otel"
-    os.environ["OTEL_EXPORTER_OTLP_HEADERS"] = f"Authorization=Basic {auth}"
+    return setup_langfuse()
 
-    # Remove conflicting OTEL env vars
-    for key in [
-        "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
-        "AGENT_OBSERVABILITY_ENABLED",
-        "OTEL_PYTHON_DISTRO",
-        "OTEL_RESOURCE_ATTRIBUTES",
-        "OTEL_PYTHON_CONFIGURATOR",
-        "OTEL_PYTHON_EXCLUDED_URLS",
-    ]:
-        os.environ.pop(key, None)
+
+def model_settings(model_id: str, temperature: float) -> dict:
+    """Keep sampling settings where supported; Claude 5 does not accept temperature."""
+    if "claude-sonnet-5" in model_id or "claude-opus-5" in model_id:
+        return {"additional_request_fields": {"output_config": {"effort": "low"}}}
+    return {"temperature": temperature}
+
+
+def assistant_text(result) -> str:
+    """Claude responses may contain reasoning/tool blocks before visible text."""
+    return "".join(block["text"] for block in result.message["content"] if "text" in block)
 
 
 def classify_query_complexity(query: str) -> str:
@@ -52,8 +46,9 @@ def classify_query_complexity(query: str) -> str:
 
 
 # Cross-region inference model IDs
-MODEL_SONNET = "us.anthropic.claude-sonnet-4-6"
-MODEL_HAIKU = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+MODEL_SONNET = os.environ.get("WORKSHOP_MODEL_WORKHORSE", "global.anthropic.claude-sonnet-5")
+MODEL_HAIKU = os.environ.get("WORKSHOP_MODEL_SMALL", "global.anthropic.claude-haiku-4-5-20251001-v1:0")
+MODEL_OPUS = os.environ.get("WORKSHOP_MODEL_JUDGE", "global.anthropic.claude-opus-5")
 
 # Troubleshooting method block. Inlined into the prompt for v2-v5 (every query pays
 # for it); externalized into an on-demand skill for v6 (loaded only when a

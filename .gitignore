@@ -79,3 +79,4 @@ Dockerfile
 prompt_opt_images.drawio
 .$*.drawio.bkp
 *.drawio.bkp
+.workshop-readiness.json

@@ -34,6 +34,8 @@ def deploy_agent_to_runtime(
     agentcore_runtime = Runtime()
 
     configure_kwargs = {
+        "deployment_type": "container",
+        "disable_otel": True,
         "entrypoint": agent_file,
         "auto_create_ecr": True,
         "requirements_file": requirements_file,
@@ -110,7 +112,10 @@ def ensure_runtime_permissions(region: str | None = None) -> None:
                 "Sid": "KnowledgeBaseIdLookup",
                 "Effect": "Allow",
                 "Action": "ssm:GetParameter",
-                "Resource": f"arn:aws:ssm:{region}:{account_id}:parameter/{account_id}-{region}/kb/knowledge-base-id",
+                "Resource": [
+                    f"arn:aws:ssm:{region}:{account_id}:parameter/{account_id}-{region}/kb/knowledge-base-id",
+                    f"arn:aws:ssm:{region}:{account_id}:parameter/app/customersupport/kb/type",
+                ],
             },
             {
                 "Sid": "KnowledgeBaseRetrieve",
@@ -153,14 +158,22 @@ def invoke_agent_with_timing(data_client, agent_arn: str, prompt: str) -> tuple:
     return response, latency_ms
 
 
-def find_agent_by_name(control_client, agent_name: str) -> str:
-    """Find agent ARN by name."""
-    response = control_client.list_agent_runtimes()
-    agents = response.get("agentRuntimes", [])
-    for agent in agents:
-        if agent_name in agent["agentRuntimeName"]:
-            return agent["agentRuntimeArn"]
-    return None
+def find_agent_by_name(control_client, agent_name: str) -> str | None:
+    """Find the intended Runtime across all pages, accepting old name separators."""
+    matches = []
+    next_token = None
+    needle = agent_name.replace("-", "_")
+    while True:
+        page = control_client.list_agent_runtimes(**({"nextToken": next_token} if next_token else {}))
+        matches.extend(
+            agent for agent in page.get("agentRuntimes", []) if needle in agent["agentRuntimeName"].replace("-", "_")
+        )
+        next_token = page.get("nextToken")
+        if not next_token:
+            break
+    if len(matches) > 1:
+        raise ValueError(f"Multiple Runtimes match {agent_name}; select the intended deployment")
+    return matches[0]["agentRuntimeArn"] if matches else None
 
 
 def run_test_scenarios(data_client, agent_arn: str, scenarios: list) -> list:

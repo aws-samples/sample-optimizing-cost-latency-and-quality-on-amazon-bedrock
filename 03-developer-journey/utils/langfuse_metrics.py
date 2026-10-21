@@ -149,181 +149,85 @@ def print_metrics_table():
         print("=" * 120 + "\n")
 
 
-def get_latest_trace_metrics(
-    agent_name: str = "customer-support-v1-baseline",
-    wait_seconds: int = 5,
-    max_retries: int = 5,
-    timeout_seconds: int = 120,
-) -> dict:
-    """
-    Get metrics from the latest trace for a given agent using Langfuse SDK.
+def trace_reader():
+    """Read-only SDK client; does not create or shut down a tracing provider."""
+    from langfuse.api import LangfuseAPI
 
-    Args:
-        agent_name: Name of the agent to filter traces by
-        wait_seconds: Seconds to wait for trace to be ingested
-        max_retries: Number of retries on timeout
-        timeout_seconds: Timeout per request
-
-    Returns:
-        dict with metrics
-    """
-    import httpx
-    from langfuse import Langfuse
-
-    public_key = os.environ.get("LANGFUSE_PUBLIC_KEY")
-    secret_key = os.environ.get("LANGFUSE_SECRET_KEY")
-    host = os.environ.get("LANGFUSE_BASE_URL", "https://cloud.langfuse.com")
-
-    if not public_key or not secret_key:
-        return {"error": "LANGFUSE_PUBLIC_KEY or LANGFUSE_SECRET_KEY not set"}
-
-    # Wait for trace to be ingested (silently)
-    if wait_seconds > 0:
-        time.sleep(wait_seconds)  # nosemgrep: python.lang.best-practice.arbitrary-sleep
-
-    # Create client with extended timeout
-    langfuse = Langfuse(
-        public_key=public_key,
-        secret_key=secret_key,
-        host=host,
-        httpx_client=httpx.Client(timeout=timeout_seconds),
+    return LangfuseAPI(
+        base_url=os.environ.get("LANGFUSE_BASE_URL", "https://cloud.langfuse.com"),
+        username=os.environ["LANGFUSE_PUBLIC_KEY"],
+        password=os.environ["LANGFUSE_SECRET_KEY"],
     )
 
-    # Fetch traces with retries (silently)
-    traces = None
+
+def get_latest_trace_metrics(
+    agent_name="customer-support-v1-baseline", wait_seconds=5, max_retries=24, timeout_seconds=120, *, session_id=None
+):
+    """Read this invocation's generations; keep the old call name for notebook compatibility."""
+    if not session_id:
+        raise ValueError("Supply the Runtime session ID; newest-project-trace lookup is not reliable")
+    reader = trace_reader()
+    deadline = time.monotonic() + timeout_seconds
     for attempt in range(max_retries):
-        try:
-            traces = langfuse.api.trace.list(limit=5)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             break
-        except Exception as e:
-            if attempt < max_retries - 1:
-                time.sleep(5)  # nosemgrep: python.lang.best-practice.arbitrary-sleep
-            else:
-                return {"error": f"Failed after {max_retries} attempts: {e}"}
-
-    if not traces or not traces.data:
-        return {"error": "No traces returned"}
-
-    # Find the latest trace for this agent
-    latest_trace = None
-    for trace in traces.data:
-        trace_name = getattr(trace, "name", "") or ""
-        if agent_name in trace_name:
-            latest_trace = trace
+        if wait_seconds:
+            time.sleep(min(wait_seconds, remaining))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             break
-
-    if not latest_trace:
-        return {"error": f"No trace found for agent: {agent_name}"}
-
-    trace_id = latest_trace.id
-
-    # Get observations for this trace
-    try:
-        obs_response = langfuse.api.observations.get_many(trace_id=trace_id, limit=50)
-        observations = obs_response.data if hasattr(obs_response, "data") else []
-    except Exception:
-        observations = []
-
-    # Helper to safely convert string/int/dict values to int
-    def safe_int(val):
-        if val is None:
-            return 0
-        if isinstance(val, (int, float)):
-            return int(val)
-        if isinstance(val, str):
-            # Check if it's a JSON string like '{"intValue":0}'
-            if val.startswith("{"):
-                try:
-                    import json
-
-                    parsed = json.loads(val)
-                    if isinstance(parsed, dict):
-                        return int(parsed.get("intValue", 0) or 0)
-                except (json.JSONDecodeError, ValueError):
-                    pass
-            # Try direct int conversion
-            try:
-                return int(val)
-            except ValueError:
-                return 0
-        if isinstance(val, dict):
-            # OTEL sometimes stores as {"intValue": 123}
-            return int(val.get("intValue", 0) or 0)
-        return 0
-
-    # Calculate metrics from observations - only count GENERATION type to avoid double-counting
-    total_input_tokens = 0
-    total_output_tokens = 0
-    total_cache_read_tokens = 0
-    total_cache_write_tokens = 0
-    total_cost = 0.0
-
-    for obs in observations:
-        obs_type = getattr(obs, "type", None)
-        # Only count GENERATION observations to avoid double-counting with spans
-        if obs_type != "GENERATION":
+        options = {"timeout_in_seconds": min(remaining, 30), "max_retries": 0}
+        traces = reader.trace.list(session_id=session_id, limit=100, request_options=options).data
+        # List summaries can lag behind the complete record during ingestion.
+        matches = []
+        for summary in traces:
+            full = reader.trace.get(summary.id, request_options=options)
+            if agent_name in (full.name or "") or any(
+                agent_name in (observation.name or "") for observation in full.observations
+            ):
+                matches.append(full)
+        if len(matches) > 1:
+            raise ValueError("Multiple matching traces for this invocation; inspect the session")
+        if not matches:
+            if attempt == 0:
+                print("Waiting for this invocation to arrive in Langfuse...")
             continue
-
-        usage = getattr(obs, "usage", None) or {}
-        metadata = getattr(obs, "metadata", None) or {}
-
-        # Extract from usage dict
-        if isinstance(usage, dict):
-            inp = safe_int(usage.get("input") or usage.get("promptTokens") or usage.get("input_tokens"))
-            out = safe_int(usage.get("output") or usage.get("completionTokens") or usage.get("output_tokens"))
-            # Cache metrics - check multiple possible locations
-            cache_read = safe_int(
-                usage.get("cache_read_input_tokens") or usage.get("cacheReadInputTokens") or usage.get("cacheRead")
-            )
-            cache_write = safe_int(
-                usage.get("cache_creation_input_tokens")
-                or usage.get("cacheWriteInputTokens")
-                or usage.get("cacheCreationInputTokens")
-                or usage.get("cacheWrite")
-            )
-        else:
-            inp = safe_int(getattr(usage, "input", None) or getattr(usage, "prompt_tokens", None))
-            out = safe_int(getattr(usage, "output", None) or getattr(usage, "completion_tokens", None))
-            cache_read = safe_int(getattr(usage, "cache_read_input_tokens", None))
-            cache_write = safe_int(getattr(usage, "cache_creation_input_tokens", None))
-
-        # Check metadata['attributes'] for OTEL gen_ai attributes
-        if isinstance(metadata, dict):
-            attrs = metadata.get("attributes", {})
-            if isinstance(attrs, dict):
-                if cache_read == 0:
-                    cache_read = safe_int(attrs.get("gen_ai.usage.cache_read_input_tokens"))
-                if cache_write == 0:
-                    cache_write = safe_int(
-                        attrs.get("gen_ai.usage.cache_creation_input_tokens")
-                        or attrs.get("gen_ai.usage.cache_write_input_tokens")
-                    )
-
-        total_input_tokens += inp
-        total_output_tokens += out
-        total_cache_read_tokens += cache_read
-        total_cache_write_tokens += cache_write
-
-        cost = getattr(obs, "calculated_total_cost", None) or getattr(obs, "calculatedTotalCost", 0) or 0
-        total_cost += float(cost) if cost else 0.0
-
-    # Get latency from trace
-    latency_seconds = getattr(latest_trace, "latency", None)
-
-    langfuse.shutdown()
-
-    return {
-        "trace_id": trace_id,
-        "trace_name": getattr(latest_trace, "name", "unknown"),
-        "latency_seconds": latency_seconds,
-        "cost_usd": total_cost,
-        "input_tokens": total_input_tokens,
-        "output_tokens": total_output_tokens,
-        "total_tokens": total_input_tokens + total_output_tokens,
-        "cache_read_tokens": total_cache_read_tokens,
-        "cache_write_tokens": total_cache_write_tokens,
-        "langfuse_url": f"{host}/trace/{trace_id}",
-    }
+        trace = matches[0]
+        generations = [o.dict() for o in trace.observations if o.type == "GENERATION"]
+        if not generations or any(
+            not g.get("usageDetails") or g.get("calculatedTotalCost") is None for g in generations
+        ):
+            continue
+        totals = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "cost_usd": 0.0,
+        }
+        for generation in generations:
+            usage = generation.get("usageDetails") or {}
+            if not usage or generation.get("calculatedTotalCost") is None:
+                raise ValueError("Generation has missing usage/pricing; it is not a free call")
+            totals["input_tokens"] += usage.get("input", 0)
+            totals["output_tokens"] += usage.get("output", 0)
+            totals["cache_read_tokens"] += usage.get("cache_read_input_tokens", 0)
+            totals["cache_write_tokens"] += sum(v for k, v in usage.items() if k.startswith("cache_write_"))
+            totals["cost_usd"] += generation["calculatedTotalCost"]
+        return {
+            **totals,
+            "trace_id": trace.id,
+            "trace_name": trace.name,
+            "session_id": session_id,
+            "latency_seconds": trace.latency,
+            "model_calls": len(generations),
+            "total_tokens": sum(
+                totals[k] for k in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
+            ),
+            "langfuse_url": os.environ.get("LANGFUSE_BASE_URL", "https://cloud.langfuse.com") + trace.html_path,
+        }
+    raise TimeoutError(f"No complete trace for {agent_name}, session {session_id}; do not evaluate missing data")
 
 
 def calculate_totals_from_collected() -> dict:
@@ -385,7 +289,7 @@ def load_metrics(version: str) -> dict:
     }
 
     if not METRICS_FILE.exists():
-        print(f"No saved metrics found. Run the previous lab first.")
+        print("No saved metrics found. Run the previous lab first.")
         return empty
 
     data = json.loads(METRICS_FILE.read_text())

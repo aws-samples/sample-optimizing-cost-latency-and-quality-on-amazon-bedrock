@@ -18,7 +18,6 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.types import Tool as MCPTool
 from strands import Agent
 from strands.models import BedrockModel
-from strands.telemetry import StrandsTelemetry
 from strands.tools.mcp import MCPClient
 from strands.tools.mcp.mcp_client import MCPAgentTool
 from strands.types.content import SystemContentBlock
@@ -28,9 +27,13 @@ from utils.agent_config import (
     MODEL_HAIKU,
     MODEL_SONNET,
     SYSTEM_PROMPT_CORE,
+    assistant_text,
     classify_query_complexity,
+    model_settings,
     setup_langfuse_telemetry,
 )
+from utils.gateway_response import gateway_search_tools
+from utils.langfuse_setup import current_session_id
 
 setup_langfuse_telemetry()
 
@@ -96,7 +99,7 @@ def search_results_to_tools(results, client, top_n=1):
     for tool in results[:top_n]:
         mcp_tool = MCPTool(
             name=tool["name"],
-            description=tool["description"],
+            description=tool.get("description"),
             inputSchema=tool["inputSchema"],
         )
         tools.append(MCPAgentTool(mcp_tool, client))
@@ -106,9 +109,9 @@ def search_results_to_tools(results, client, top_n=1):
 @app.entrypoint
 def invoke(payload, context=None):
     user_input = payload.get("prompt", "")
+    session_id = current_session_id(payload)
 
-    telemetry = StrandsTelemetry()
-    telemetry.setup_otlp_exporter()
+    telemetry = setup_langfuse_telemetry()
 
     complexity = classify_query_complexity(user_input)
     model_id = MODEL_HAIKU if complexity == "simple" else MODEL_SONNET
@@ -135,12 +138,12 @@ def invoke(payload, context=None):
             name="x_amz_bedrock_agentcore_search",
             arguments={"query": user_input},
         )
-        found_tools = search_result["structuredContent"]["tools"]
+        found_tools = gateway_search_tools(search_result)
         tools = search_results_to_tools(found_tools, mcp_client)
 
         model_kwargs = {
             "model_id": model_id,
-            "temperature": 0.1,
+            **model_settings(model_id, 0.1),
             "max_tokens": 1024,
             # No stop_sequences: max_tokens + the model's own end_turn bound output;
             # a markdown-collision stop string (e.g. "###") only risks truncating answers.
@@ -165,6 +168,7 @@ def invoke(payload, context=None):
             plugins=[skills_plugin],
             name="customer-support-v6-gateway",
             trace_attributes={
+                "session.id": session_id,
                 "version": "v6-gateway",
                 "tools_loaded": len(tools),
                 "query_complexity": complexity,
@@ -173,10 +177,10 @@ def invoke(payload, context=None):
         )
 
         response = agent(user_input)
-        response_text = response.message["content"][0]["text"]
+        response_text = assistant_text(response)
 
         skill_used = bool(skills_plugin.get_activated_skills(agent))
-        telemetry.tracer_provider.force_flush()
+        telemetry.flush()
 
         return {"response": response_text, "tools_loaded": len(tools), "skill_activated": skill_used}
 
