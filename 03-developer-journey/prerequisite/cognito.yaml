@@ -33,6 +33,8 @@ Resources:
     Type: AWS::Cognito::UserPool
     Properties:
       UserPoolName: !Ref UserPoolName
+      UserPoolTags:
+        Application: CustomerSupport
       MfaConfiguration: 'OFF'
       UsernameConfiguration:
         CaseSensitive: false

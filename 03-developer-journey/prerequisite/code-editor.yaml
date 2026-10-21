@@ -1436,7 +1436,158 @@ Resources:
       CodeEditorPassword: !GetAtt SecretPlaintext.password
       LinuxFlavor: !If [IsAL2023, 'al2023', 'ubuntu']
 
-  # WORKSHOP POSTURE: This role is intentionally broad so participants can explore AWS during the workshop. ReadOnlyAccess grants read on every service in the account.
+  # Keep scoped data grants below the 6,144-character managed-policy limit,
+  # leaving deployment permissions below the role's inline-policy limit.
+  WorkshopDataAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Data and repository access for the workshop Code Editor.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: LambdaAccess
+            Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+              - lambda:GetFunction
+              - lambda:GetFunctionConfiguration
+              - lambda:CreateFunction
+              - lambda:UpdateFunctionCode
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:workshop-gateway-tools'
+              - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${InfrastructureStackName}-CustomerSupportLambda-*'
+          - Sid: LambdaLayerReadAccess
+            Effect: Allow
+            Action:
+              - lambda:GetLayerVersion
+              - lambda:ListLayerVersions
+            Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:layer:*'
+          - Sid: LambdaDiscovery
+            Effect: Allow
+            Action:
+              - lambda:ListFunctions
+              - lambda:ListLayers
+            Resource: '*'
+          - Sid: DynamoDBAccess
+            Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:UpdateItem
+              - dynamodb:DeleteItem
+              - dynamodb:Query
+              - dynamodb:Scan
+              - dynamodb:DescribeTable
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${InfrastructureStackName}-WarrantyTable-*'
+              - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${InfrastructureStackName}-CustomerProfileTable-*'
+          - Sid: SSMParameterAccess
+            Effect: Allow
+            Action:
+              - ssm:GetParameter
+              - ssm:GetParameters
+              - ssm:GetParametersByPath
+              - ssm:PutParameter
+              - ssm:DeleteParameter
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/app/customersupport/*'
+              - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/prompt-pipeline/*'
+          - Sid: ParameterAndTableDiscovery
+            Effect: Allow
+            Action:
+              - ssm:DescribeParameters
+              - dynamodb:ListTables
+            Resource: '*'
+          - Sid: CognitoAccess
+            Effect: Allow
+            Action:
+              - cognito-idp:DescribeUserPool
+              - cognito-idp:DescribeUserPoolClient
+              - cognito-idp:ListUserPoolClients
+              - cognito-idp:AdminCreateUser
+              - cognito-idp:AdminDeleteUser
+              - cognito-idp:AdminGetUser
+              - cognito-idp:AdminInitiateAuth
+              - cognito-idp:AdminAddUserToGroup
+            Resource: !Sub 'arn:${AWS::Partition}:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/*'
+            Condition:
+              StringEquals:
+                aws:ResourceTag/Application: CustomerSupport
+          # InitiateAuth/SignUp/ConfirmSignUp use app-client authentication;
+          # Cognito does not evaluate IAM policies for those operations.
+          - Sid: CognitoDiscovery
+            Effect: Allow
+            Action: cognito-idp:ListUserPools
+            Resource: '*'
+          - Sid: SecretsManagerAccess
+            Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+              - secretsmanager:PutSecretValue
+              - secretsmanager:DescribeSecret
+            Resource: !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:langfuse-pipeline-credentials-??????'
+          - Sid: CodeCommitAccess
+            Effect: Allow
+            Action:
+              - codecommit:Get*
+              - codecommit:List*
+              - codecommit:Describe*
+              - codecommit:GitPull
+              - codecommit:GitPush
+              - codecommit:CreateCommit
+            Resource: !Sub 'arn:${AWS::Partition}:codecommit:${AWS::Region}:${AWS::AccountId}:prompt-repo'
+          - Sid: CodePipelineAccess
+            Effect: Allow
+            Action:
+              - codepipeline:Get*
+              - codepipeline:List*
+              - codepipeline:StartPipelineExecution
+              - codepipeline:PutApprovalResult
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:prompt-evaluation-pipeline'
+              - !Sub 'arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:prompt-evaluation-pipeline/*'
+          - Sid: PipelineDiscovery
+            Effect: Allow
+            Action:
+              - codecommit:ListRepositories
+              - codepipeline:ListPipelines
+            Resource: '*'
+          - Sid: PipelineArtifactsRead
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:ListBucket
+              - s3:GetBucketLocation
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:s3:::prompt-pipeline-artifacts-${AWS::AccountId}'
+              - !Sub 'arn:${AWS::Partition}:s3:::prompt-pipeline-artifacts-${AWS::AccountId}/*'
+          - Sid: ECRAccess
+            Effect: Allow
+            Action:
+              - ecr:CreateRepository
+              - ecr:DeleteRepository
+              - ecr:DescribeRepositories
+              - ecr:DescribeImages
+              - ecr:ListImages
+              - ecr:ListTagsForResource
+              - ecr:TagResource
+              - ecr:BatchCheckLayerAvailability
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+              - ecr:BatchDeleteImage
+              - ecr:InitiateLayerUpload
+              - ecr:UploadLayerPart
+              - ecr:CompleteLayerUpload
+              - ecr:PutImage
+            Resource: !Sub 'arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/bedrock-agentcore-*'
+          - Sid: ECRAuthentication
+            Effect: Allow
+            Action: ecr:GetAuthorizationToken
+            Resource: '*'
+
+  # Participant data access and mutations are limited to workshop resources.
+  # Service discovery APIs that require Resource "*" have separate statements.
   CodeEditorInstanceBootstrapRole:
     Type: AWS::IAM::Role
     Properties:
@@ -1450,11 +1601,10 @@ Resources:
                 - !Sub ssm.${AWS::URLSuffix}
             Action: sts:AssumeRole
       ManagedPolicyArns:
+        - !Ref WorkshopDataAccessPolicy
         - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
         - !Sub arn:${AWS::Partition}:iam::aws:policy/CloudWatchAgentServerPolicy
         - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonQDeveloperAccess
-        - !Sub arn:${AWS::Partition}:iam::aws:policy/ReadOnlyAccess
-        - !Sub arn:${AWS::Partition}:iam::aws:policy/AWSCodeCommitPowerUser
         # Bedrock access for workshop participants
         - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonBedrockFullAccess
         # Marketplace for model subscriptions
@@ -1545,57 +1695,6 @@ Resources:
                 Action:
                   - s3vectors:*
                 Resource: '*'
-              - Sid: LambdaAccess
-                Effect: Allow
-                Action:
-                  - lambda:InvokeFunction
-                  - lambda:GetFunction
-                  - lambda:GetFunctionConfiguration
-                  - lambda:CreateFunction
-                  - lambda:UpdateFunctionCode
-                  - lambda:ListFunctions
-                  - lambda:GetLayerVersion
-                  - lambda:ListLayerVersions
-                  - lambda:ListLayers
-                Resource: '*'
-              - Sid: DynamoDBAccess
-                Effect: Allow
-                Action:
-                  - dynamodb:GetItem
-                  - dynamodb:PutItem
-                  - dynamodb:UpdateItem
-                  - dynamodb:DeleteItem
-                  - dynamodb:Query
-                  - dynamodb:Scan
-                  - dynamodb:DescribeTable
-                  - dynamodb:ListTables
-                Resource: '*'
-              - Sid: SSMParameterAccess
-                Effect: Allow
-                Action:
-                  - ssm:GetParameter
-                  - ssm:GetParameters
-                  - ssm:GetParametersByPath
-                  - ssm:DescribeParameters
-                  - ssm:PutParameter
-                  - ssm:DeleteParameter
-                Resource: '*'
-              - Sid: CognitoAccess
-                Effect: Allow
-                Action:
-                  - cognito-idp:DescribeUserPool
-                  - cognito-idp:DescribeUserPoolClient
-                  - cognito-idp:ListUserPools
-                  - cognito-idp:ListUserPoolClients
-                  - cognito-idp:AdminCreateUser
-                  - cognito-idp:AdminDeleteUser
-                  - cognito-idp:AdminGetUser
-                  - cognito-idp:AdminInitiateAuth
-                  - cognito-idp:AdminAddUserToGroup
-                  - cognito-idp:InitiateAuth
-                  - cognito-idp:SignUp
-                  - cognito-idp:ConfirmSignUp
-                Resource: '*'
               - Sid: WorkshopGatewayConfiguration
                 Effect: Allow
                 Action: lambda:UpdateFunctionConfiguration
@@ -1623,50 +1722,57 @@ Resources:
                   - cloudwatch:GetMetricData
                   - cloudwatch:GetMetricStatistics
                   - cloudwatch:ListMetrics
-                  - cloudwatch:PutMetricData
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
                   - logs:DescribeLogGroups
-                  - logs:DescribeLogStreams
-                  - logs:GetLogEvents
-                  - logs:StartQuery
                   - logs:GetQueryResults
-                  - logs:PutResourcePolicy
-                  - logs:DeleteResourcePolicy
+                  - logs:StopQuery
                   - logs:DescribeResourcePolicies
-                  - logs:PutDeliverySource
-                  - logs:PutDeliveryDestination
-                  - logs:CreateDelivery
-                  - logs:DeleteDelivery
                   - logs:DescribeDeliveries
                   - logs:DescribeDeliverySources
                   - logs:DescribeDeliveryDestinations
                 Resource: '*'
-              - Sid: SecretsManagerAccess
+              - Sid: WorkshopMetricWrites
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace:
+                      - bedrock-agentcore
+                      - CWAgent
+              - Sid: WorkshopLogAccess
                 Effect: Allow
                 Action:
-                  - secretsmanager:GetSecretValue
-                  - secretsmanager:PutSecretValue
-                  - secretsmanager:DescribeSecret
-                Resource: '*'
-              - Sid: CodeCommitAccess
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                  - logs:DescribeIndexPolicies
+                  - logs:FilterLogEvents
+                  - logs:GetLogEvents
+                  - logs:StartQuery
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/*'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/vendedlogs/bedrock-agentcore/*'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${NotebookLogGroup}'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${NotebookLogGroup}:*'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans:*'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*'
+              # The infrastructure stack configures the account-level X-Ray
+              # resource policy. Participants only manage their trace deliveries.
+              - Sid: WorkshopDeliveryAccess
                 Effect: Allow
                 Action:
-                  - codecommit:Get*
-                  - codecommit:List*
-                  - codecommit:Describe*
-                  - codecommit:GitPull
-                  - codecommit:CreateCommit
-                Resource: '*'
-              - Sid: CodePipelineAccess
-                Effect: Allow
-                Action:
-                  - codepipeline:Get*
-                  - codepipeline:List*
-                  - codepipeline:StartPipelineExecution
-                  - codepipeline:PutApprovalResult
-                Resource: '*'
+                  - logs:PutDeliverySource
+                  - logs:PutDeliveryDestination
+                  - logs:CreateDelivery
+                  - logs:DeleteDelivery
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:delivery-source:*-logs-source'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:delivery-source:*-traces-source'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:delivery-destination:*-logs-destination'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:delivery-destination:*-traces-destination'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:delivery:*'
               - Sid: XRayAccess
                 Effect: Allow
                 Action:
@@ -1674,11 +1780,8 @@ Resources:
                   - xray:PutTelemetryRecords
                   - xray:GetSamplingRules
                   - xray:GetSamplingTargets
-                Resource: '*'
-              - Sid: ECRAccess
-                Effect: Allow
-                Action:
-                  - ecr:*
+                  - xray:PutSpans
+                  - xray:GetTraceSegmentDestination
                 Resource: '*'
               - Sid: IAMRoleCreationScoped
                 Effect: Allow
@@ -1703,6 +1806,23 @@ Resources:
                   - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/AmazonBedrockAgentCoreSDKCodeBuild-*'
                   - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${InfrastructureStackName}-GatewayAgentCoreRole-*'
                   - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/service-role/${InfrastructureStackName}-CustomerSupportLambdaRole-*'
+              - Sid: WorkshopExecutionRoleRead
+                Effect: Allow
+                Action:
+                  - iam:GetRole
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/techmart-*'
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${InfrastructureStackName}-CustomerSupportLambdaRole-*'
+                  - !If [HasRuntimeRoleArn, !Ref RuntimeRoleArn, !Ref AWS::NoValue]
+                  - !If [HasEvaluationRoleArn, !Ref EvaluationRoleArn, !Ref AWS::NoValue]
+                  - !If [HasABTestRoleArn, !Ref ABTestRoleArn, !Ref AWS::NoValue]
+              - Sid: IAMRoleDiscovery
+                Effect: Allow
+                Action: iam:ListRoles
+                Resource: '*'
               - Sid: IAMPassRoleToAgentCore
                 Effect: Allow
                 Action:
