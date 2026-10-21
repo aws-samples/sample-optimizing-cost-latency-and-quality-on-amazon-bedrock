@@ -559,7 +559,7 @@ def test_actual_notebook_rejects_unsupported_override_without_model_fallback():
     from workshop_utils.models import UnsupportedFeatureError
 
     with pytest.raises(UnsupportedFeatureError, match="structured_output"):
-        run_notebook_context(model_id="global.anthropic.claude-sonnet-5")
+        run_notebook_context(model_id="global.openai.gpt-5.6-sol")
 
 
 def test_actual_notebook_keeps_fenced_failures_and_their_costs():

@@ -52,6 +52,14 @@ class FakeClient:
 
 
 class ModelTests(unittest.TestCase):
+    def test_claude_converse_supports_schema_output_and_strict_tool_inputs(self):
+        for spec in MODEL_CATALOG.values():
+            if spec.provider != "anthropic":
+                continue
+            with self.subTest(model=spec.model_id):
+                spec.capabilities.require("structured_output")
+                spec.capabilities.require("strict_tools")
+
     def test_sonnet_46_supports_documented_max_effort_without_xhigh(self):
         record = caps("global.anthropic.claude-sonnet-4-6")
         self.assertEqual(record.effort_values, ("low", "medium", "high", "max"))
@@ -174,7 +182,10 @@ class ModelTests(unittest.TestCase):
             with self.subTest(model_id=model_id):
                 record = caps(model_id)
                 self.assertEqual(record.cache_min_tokens, minimum)
-                expected_date = "2026-09-30" if model_id.endswith("claude-sonnet-4-6") else "2026-09-24"
+                expected_date = (
+                    "2026-09-30" if model_id.endswith("claude-sonnet-4-6")
+                    else "2026-09-24" if model_id == HAIKU else "2026-10-21"
+                )
                 self.assertEqual(record.verified_on, expected_date)
                 self.assertTrue(all(url.startswith("https://") for url in record.sources))
         self.assertTrue(all(spec.capabilities.sources for spec in MODEL_CATALOG.values()))
