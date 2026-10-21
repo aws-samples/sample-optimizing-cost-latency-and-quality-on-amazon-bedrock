@@ -15,12 +15,11 @@ Metrics and their scope:
 
 Judge + embeddings run on Bedrock via the langchain-aws wrappers (no OpenAI key).
 
-Stack (verified live against Bedrock -- see CONTEXT.md and
-docs/adr/0001-local-ragas-quality-evals.md):
-    ragas==0.4.0, langchain-aws==0.2.35, langchain-community==0.3.27
-The legacy `ragas.metrics` API is used deliberately: the newer
-`ragas.metrics.collections` API reaches Bedrock via LiteLLM+Instructor, which
-sends temperature+top_p together and Claude Sonnet 4.5 rejects that.
+Pinned stack (see requirements-eval.txt):
+    ragas==0.4.0, langchain-aws==1.0.0, langchain-community==0.3.29
+The legacy `ragas.metrics` API is retained to preserve this lab's scoring
+behavior while using patched LangChain packages. The multimodal Collections
+API and persistent DiskCache backend are not used by these helpers.
 """
 
 from __future__ import annotations
@@ -30,8 +29,7 @@ import datetime as _dt
 import re
 import warnings
 
-# RAGAS emits a cosmetic deprecation warning for the Langchain wrappers; the
-# legacy API is the only one that works with a Bedrock judge today.
+# Keep the established LangChain-backed metrics rather than changing the judge API.
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="ragas")
 
 from ragas import SingleTurnSample
