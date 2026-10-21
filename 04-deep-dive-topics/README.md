@@ -63,7 +63,7 @@ End-to-end production prompt lifecycle management using Langfuse for versioning,
 
 ---
 
-The [pipeline prerequisite template](../03-developer-journey/prerequisite/legacy-prompt-pipeline.yaml) provides the CodeCommit repository, CodeBuild project, manual approval and Langfuse promotion function used by this notebook. Workshop Studio provisions it automatically. For a self-led run, deploy this template before starting the CI/CD section.
+The [pipeline prerequisite template](../03-developer-journey/prerequisite/legacy-prompt-pipeline.yaml) provides the CodeCommit repository, CodeBuild project, manual approval and Langfuse promotion function used by this notebook. Workshop Studio includes these resources in its **PromptPipeline** stack. For a self-led run, deploy the standalone template before starting the CI/CD section; skip it if those resources are already provisioned.
 
 ## Files Structure
 
