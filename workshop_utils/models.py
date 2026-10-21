@@ -122,6 +122,7 @@ _AWS = "https://docs.aws.amazon.com/bedrock/latest/userguide/"
 _CACHING = _AWS + "prompt-caching.html"
 _QUOTAS = _AWS + "quotas-token-burndown.html"
 _BATCH = _AWS + "batch-inference-supported.html"
+_STRUCTURED_OUTPUTS = _AWS + "claude-messages-structured-outputs.html"
 _CLAUDE_EFFORT = "https://platform.claude.com/docs/en/build-with-claude/effort"
 _GPT_LAUNCH = (
     "https://aws.amazon.com/blogs/machine-learning/"
@@ -136,9 +137,10 @@ _SPECS = (
         "anthropic",
         ("global", "us", "eu", "au"),
         _capabilities(
-            supported="invocation effort tools forced_tool_choice cache_points guardrails",
-            unsupported="temperature top_p top_k structured_output strict_tools batch count_tokens prefill",
-            sources=(_AWS + "model-card-anthropic-claude-sonnet-5.html", _CACHING, _CLAUDE_EFFORT, _QUOTAS, _BATCH),
+            supported="invocation effort tools forced_tool_choice structured_output strict_tools cache_points guardrails",
+            unsupported="temperature top_p top_k batch count_tokens prefill",
+            sources=(_AWS + "model-card-anthropic-claude-sonnet-5.html", _CACHING, _CLAUDE_EFFORT, _QUOTAS, _BATCH, _STRUCTURED_OUTPUTS),
+            verified_on="2026-10-21",
             effort_values=("low", "medium", "high", "xhigh", "max"),
             default_effort="high",
             thinking_types=("adaptive", "disabled"),
@@ -159,9 +161,10 @@ _SPECS = (
         "anthropic",
         ("global", "us"),
         _capabilities(
-            supported="invocation effort tools cache_points guardrails batch",
-            unsupported="temperature top_p top_k structured_output strict_tools count_tokens prefill",
-            sources=(_AWS + "model-card-anthropic-claude-opus-5.html", _CACHING, _CLAUDE_EFFORT, _QUOTAS, _BATCH),
+            supported="invocation effort tools structured_output strict_tools cache_points guardrails batch",
+            unsupported="temperature top_p top_k count_tokens prefill",
+            sources=(_AWS + "model-card-anthropic-claude-opus-5.html", _CACHING, _CLAUDE_EFFORT, _QUOTAS, _BATCH, _STRUCTURED_OUTPUTS),
+            verified_on="2026-10-21",
             effort_values=("low", "medium", "high", "xhigh", "max"),
             default_effort="high",
             thinking_types=("adaptive", "disabled"),
@@ -179,9 +182,10 @@ _SPECS = (
         "anthropic",
         ("global", "us", "eu", "au", "jp"),
         _capabilities(
-            supported="invocation effort tools cache_points guardrails",
-            unsupported="temperature top_p top_k structured_output strict_tools forced_tool_choice batch count_tokens prefill",
-            sources=(_AWS + "model-card-anthropic-claude-opus-5-5.html", _CACHING, _CLAUDE_EFFORT, _QUOTAS, _BATCH),
+            supported="invocation effort tools structured_output strict_tools cache_points guardrails",
+            unsupported="temperature top_p top_k forced_tool_choice batch count_tokens prefill",
+            sources=(_AWS + "model-card-anthropic-claude-opus-5-5.html", _CACHING, _CLAUDE_EFFORT, _QUOTAS, _BATCH, _STRUCTURED_OUTPUTS),
+            verified_on="2026-10-21",
             effort_values=("low", "medium", "high", "xhigh", "max"),
             default_effort="medium",
             thinking_types=("adaptive",),
@@ -259,9 +263,10 @@ _SPECS = (
         "anthropic",
         ("global", "us"),
         _capabilities(
-            supported="invocation effort tools cache_points guardrails",
-            unsupported="temperature top_p top_k batch count_tokens prefill structured_output",
-            sources=(_AWS + "model-card-anthropic-claude-opus-4-8.html", _CACHING, _CLAUDE_EFFORT, _QUOTAS, _BATCH),
+            supported="invocation effort tools structured_output strict_tools cache_points guardrails",
+            unsupported="temperature top_p top_k batch count_tokens prefill",
+            sources=(_AWS + "model-card-anthropic-claude-opus-4-8.html", _CACHING, _CLAUDE_EFFORT, _QUOTAS, _BATCH, _STRUCTURED_OUTPUTS),
+            verified_on="2026-10-21",
             effort_values=("low", "medium", "high"),
             default_effort="high",
             thinking_types=("adaptive", "disabled"),

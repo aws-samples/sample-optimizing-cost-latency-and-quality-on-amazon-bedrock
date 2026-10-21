@@ -157,7 +157,6 @@ class RequestTests(unittest.TestCase):
         for model, error in (
             ("global.openai.gpt-5.6-sol", UnsupportedFeatureError),
             ("global.openai.gpt-6-sol", UnsupportedFeatureError),
-            (SONNET, UnsupportedFeatureError),
             (NOVA, UnknownCapabilityError),
         ):
             for fields in (None, {"text": {"format": {"strict": True}}}):
@@ -341,18 +340,36 @@ class RequestTests(unittest.TestCase):
         self.assertEqual(request["inferenceConfig"]["stopSequences"], ["END"])
 
     def test_structure_and_tools_are_not_substituted(self):
-        for model in (SONNET, OPUS):
-            with self.subTest(model=model), self.assertRaises(UnsupportedFeatureError):
-                build_converse_request(model, MESSAGES, output_config=FORMAT)
-        self.assertEqual(build_converse_request(HAIKU, MESSAGES, output_config=FORMAT)["outputConfig"], FORMAT)
+        for model in (SONNET, OPUS, "global.anthropic.claude-opus-5", HAIKU):
+            with self.subTest(model=model):
+                request = build_converse_request(model, MESSAGES, output_config=FORMAT)
+                self.assertEqual(request["outputConfig"], FORMAT)
+                self.assertNotIn("toolConfig", request)
         forced = {"tools": [TOOL], "toolChoice": {"tool": {"name": "classify"}}}
         self.assertEqual(build_converse_request(SONNET, MESSAGES, tool_config=forced)["toolConfig"], forced)
         with self.assertRaises(UnsupportedFeatureError):
             build_converse_request(OPUS, MESSAGES, tool_config=forced)
         strict = deepcopy(TOOL)
         strict["toolSpec"]["strict"] = True
-        with self.assertRaises(UnsupportedFeatureError):
-            build_converse_request(SONNET, MESSAGES, tool_config={"tools": [strict]})
+        for model in (SONNET, OPUS, "global.anthropic.claude-opus-5", HAIKU):
+            with self.subTest(model=model):
+                request = build_converse_request(model, MESSAGES, tool_config={"tools": [strict]})
+                self.assertEqual(request["toolConfig"]["tools"], [strict])
+                self.assertNotIn("outputConfig", request)
+
+    def test_schema_and_strict_tools_use_fields_accepted_by_the_pinned_boto_sdk(self):
+        from botocore.session import get_session
+        from botocore.validate import validate_parameters
+
+        shape = get_session().get_service_model("bedrock-runtime").operation_model("Converse").input_shape
+        strict = deepcopy(TOOL)
+        strict["toolSpec"]["strict"] = True
+        strict["toolSpec"]["inputSchema"]["json"]["additionalProperties"] = False
+        request = build_converse_request(
+            SONNET, MESSAGES, output_config=FORMAT, tool_config={"tools": [strict]}, effort="low",
+        )
+        validate_parameters(request, shape)
+        self.assertEqual(request["additionalModelRequestFields"], {"output_config": {"effort": "low"}})
 
     def test_guardrail_unknown_differs_from_disabled_feature(self):
         with self.assertRaises(UnknownCapabilityError):

@@ -161,7 +161,7 @@ def test_representative_cells_preserve_call_counts_and_show_sent_fields(lab):
         ("low-08-d0e20408", 0),
         ("low-prompted-json", 1),
         ("low-forced-tool", 1),
-        ("low-native-schema", 1),
+        ("low-native-schema", 2),
         ("low-10-0a475b0d", 2),
         ("low-temperature-comparison", 9),
         ("low-stop-sequence-comparison", 2),
@@ -243,11 +243,11 @@ def run_output_methods(lab, *, data=None, text=None, tool_calls=None,
 
 def test_output_methods_share_customer_request_contract_and_report_content_separately(lab):
     rows = run_output_methods(lab)
-    assert len(rows) == len(lab.calls) == 4  # Prompt, tool, native Haiku, native GPT.
+    assert len(rows) == len(lab.calls) == 5  # Prompt, strict tool, native Haiku, Sonnet and GPT.
     assert all(r["schema_valid"] and r["semantic_valid"] and r["passed"] for r in rows)
     assert all(all(r["semantic_checks"].values()) for r in rows)
     assert [r["model_id"] for r in rows] == [
-        lab.ns["SMALL"], lab.ns["SMALL"], lab.ns["SMALL"], lab.ns["GPT"],
+        lab.ns["SMALL"], lab.ns["SMALL"], lab.ns["SMALL"], lab.ns["WORKHORSE"], lab.ns["GPT"],
     ]
     properties = lab.ns["SCHEMA"]["properties"]
     assert properties["issue"]["type"] == "string"
@@ -259,14 +259,18 @@ def test_output_methods_share_customer_request_contract_and_report_content_separ
     native = [json.loads(request["outputConfig"]["textFormat"]["structure"]["jsonSchema"]["schema"])
               for request in lab.calls if "outputConfig" in request]
     tool_schema = lab.calls[1]["toolConfig"]["tools"][0]["toolSpec"]["inputSchema"]["json"]
-    assert native == [lab.ns["SCHEMA"], lab.ns["SCHEMA"]]
+    assert native == [lab.ns["SCHEMA"]] * 3
     assert tool_schema == lab.ns["SCHEMA"]
-    assert len(rows) == 4 and all("semantic_checks" in row for row in rows)
+    assert lab.calls[1]["toolConfig"]["tools"][0]["toolSpec"]["strict"] is True
+    assert len(rows) == 5 and all("semantic_checks" in row for row in rows)
 
 
 @pytest.mark.parametrize("issue", [
     "cracked screen; missing charger",
     "screen is cracked; charger is missing",
+    "cracked screen; charger missing from order",
+    "cracked screen on arrival; charger missing from package",
+    "the screen is cracked on arrival; the charger is missing from the box",
 ])
 def test_output_methods_accept_equivalent_specific_defect_phrases(lab, issue):
     rows = run_output_methods(lab, data={**CLASSIFIED_EMAIL, "issue": issue})
@@ -279,6 +283,9 @@ def test_output_methods_accept_equivalent_specific_defect_phrases(lab, issue):
     ("issue", "the charger is missing", "cracked_screen", True),
     ("issue", "screen is not cracked; missing charger", "cracked_screen", True),
     ("issue", "cracked screen; charger is not missing", "missing_charger", True),
+    ("issue", "screen is not cracked on arrival; missing charger", "cracked_screen", True),
+    ("issue", "cracked screen; charger is not missing from package", "missing_charger", True),
+    ("issue", "cracked screen; charger missing from package but later found", "missing_charger", True),
     ("sentiment", "neutral", "negative_sentiment", True),
     ("action", "refund", "requested_replacement", True),
     ("action", "replacement request", "requested_replacement", False),
@@ -294,10 +301,10 @@ def test_output_methods_retain_raw_wrong_facts_and_fulfilment_assumptions(
     assert all(r["schema_valid"] is schema_valid for r in rows)
     assert all(not r["semantic_checks"][failed_check] and not r["passed"] for r in rows)
     assert all(r["data"] == payload for r in rows)
-    assert len(lab.calls) == 4  # No rewrite, retry, model substitution or tool execution.
+    assert len(lab.calls) == 5  # No rewrite, retry, model substitution or tool execution.
     for result in rows:
         row = result["row"]
-        if row["label"] == "L02-tool-choice":
+        if row["label"] == "L02-strict-tool":
             assert row["response"]["output"]["message"]["content"][0]["toolUse"]["input"] == payload
         else:
             assert row["text"] == json.dumps(payload)
@@ -310,8 +317,8 @@ def test_output_methods_retain_raw_wrong_facts_and_fulfilment_assumptions(
 ])
 def test_output_methods_never_repair_fences_or_nonobjects(lab, raw):
     rows = run_output_methods(lab, text=raw)
-    text_rows = [r for r in rows if r["method"] != "L02-tool-choice"]
-    assert len(text_rows) == 3
+    text_rows = [r for r in rows if r["method"] != "L02-strict-tool"]
+    assert len(text_rows) == 4
     assert all(not r["schema_valid"] and not r["passed"] for r in text_rows)
     assert all(r["raw"] == r["row"]["text"] == raw for r in text_rows)
     assert rows[1]["passed"]  # The separate valid tool proposal remains valid.
@@ -329,7 +336,7 @@ def test_output_methods_require_exactly_one_expected_forced_tool(lab, names):
     assert result["method_checks"]["one_expected_tool"] is False
     assert not result["passed"]
     assert result["raw"] == proposals
-    assert len(lab.calls) == 4
+    assert len(lab.calls) == 5
 
 
 @pytest.mark.parametrize("text_stop,tool_stop", [
@@ -568,7 +575,7 @@ def test_visible_gpt_option_controls_the_model_comparison(lab):
 def test_unparseable_output_is_not_reported_as_wrong_facts(lab):
     rows = run_output_methods(lab, text="```json\n" + json.dumps(CLASSIFIED_EMAIL) + "\n```")
     for row in rows:
-        if row["method"] != "L02-tool-choice":
+        if row["method"] != "L02-strict-tool":
             assert row["schema_valid"] is False
             assert row["semantic_valid"] is None
             assert all(value is None for value in row["semantic_checks"].values())
