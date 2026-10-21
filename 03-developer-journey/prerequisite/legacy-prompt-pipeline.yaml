@@ -1,0 +1,564 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CodePipeline for automated prompt evaluation and deployment.
+  This template creates a CI/CD pipeline that evaluates prompt changes
+  against a Langfuse dataset before allowing deployment to production.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  LangfuseHost:
+    Type: String
+    Description: Self-hosted Langfuse URL (e.g., https://langfuse.internal.company.com)
+    Default: https://cloud.langfuse.com
+
+  RepositoryName:
+    Type: String
+    Description: CodeCommit repository name containing prompt definitions
+    Default: prompt-repo
+
+  BranchName:
+    Type: String
+    Description: Branch to monitor for changes
+    Default: main
+
+  EvalDatasetName:
+    Type: String
+    Description: Langfuse dataset name used for evaluation
+    Default: customer-support-eval
+
+  ScoreThreshold:
+    Type: String
+    Description: Minimum average score to pass quality gate (0.0 - 1.0)
+    Default: '0.7'
+
+  PassRateThreshold:
+    Type: String
+    Description: Minimum pass rate to pass quality gate (0.0 - 1.0)
+    Default: '0.8'
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for pipeline failure notifications
+    Default: ''
+
+# ---------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------
+Conditions:
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # --- CodeCommit repository ---
+  PromptRepository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Ref RepositoryName
+      RepositoryDescription: >
+        Prompt evaluation repository for CI/CD workshop.
+        Participants push evaluation scripts here to trigger the pipeline.
+
+  # --- Secrets Manager for Langfuse credentials (placeholder) ---
+  LangfuseCredentials:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: langfuse-pipeline-credentials
+      Description: >
+        Langfuse API credentials for prompt evaluation pipeline.
+        Created with placeholder values -- participants populate via notebook.
+      SecretString: '{"public_key":"PLACEHOLDER","secret_key":"PLACEHOLDER","host":"PLACEHOLDER"}'
+
+  # --- S3 bucket for pipeline artifacts ---
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'prompt-pipeline-artifacts-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 30
+
+  # --- SNS topic for notifications ---
+  PipelineNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasNotificationEmail
+    Properties:
+      TopicName: prompt-pipeline-notifications
+      Subscription:
+        - Endpoint: !Ref NotificationEmail
+          Protocol: email
+
+  # --- CodeBuild project for evaluation ---
+  EvaluationProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: prompt-evaluation
+      Description: Runs prompt evaluation against Langfuse dataset
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: EVAL_PROMPT_NAME
+            Value: customer-support-system
+          - Name: EVAL_PROMPT_LABEL
+            Value: draft
+          - Name: EVAL_DATASET_NAME
+            Value: !Ref EvalDatasetName
+          - Name: EVAL_SCORE_THRESHOLD
+            Value: !Ref ScoreThreshold
+          - Name: EVAL_PASS_RATE_THRESHOLD
+            Value: !Ref PassRateThreshold
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          env:
+            secrets-manager:
+              LANGFUSE_PUBLIC_KEY: "langfuse-pipeline-credentials:public_key"
+              LANGFUSE_SECRET_KEY: "langfuse-pipeline-credentials:secret_key"
+              LANGFUSE_BASE_URL: "langfuse-pipeline-credentials:host"
+          phases:
+            install:
+              runtime-versions:
+                python: 3.11
+              commands:
+                - pip install -q langfuse==4.15.4 boto3==1.43.101 botocore==1.43.101 httpx==0.28.1
+            pre_build:
+              commands:
+                - echo "Evaluating prompt '$EVAL_PROMPT_NAME' (label=$EVAL_PROMPT_LABEL) from Langfuse..."
+                - echo "Dataset = $EVAL_DATASET_NAME"
+                - echo "Score threshold = $EVAL_SCORE_THRESHOLD"
+            build:
+              commands:
+                - echo "Running prompt evaluation..."
+                - python scripts/evaluate_prompt.py
+            post_build:
+              commands:
+                - echo "Evaluation complete"
+                - python scripts/check_quality_gate.py
+          artifacts:
+            files:
+              - evaluation_results.json
+          cache:
+            paths:
+              - "/root/.cache/pip/**/*"
+      TimeoutInMinutes: 15
+
+  # --- Lambda function for CodePipeline deploy action ---
+  # After manual approval, this promotes the draft prompt to production
+  # in Langfuse and updates the SSM baseline score.
+  # Uses Langfuse REST API directly (no SDK dependency, no Lambda layers).
+  DeployPromptLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: prompt-deployer
+      Description: Promotes draft prompt to production in Langfuse after approval
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          LANGFUSE_CREDENTIALS_SECRET: !Ref LangfuseCredentials
+          PROMPT_NAME: customer-support-system
+          SSM_BASELINE_PARAM: /prompt-pipeline/production-baseline-score
+      Code:
+        ZipFile: |
+          """
+          CodePipeline deploy action: promote draft prompt to production in Langfuse.
+          Uses Langfuse REST API directly — no SDK or Lambda layers needed.
+          """
+          import json
+          import os
+          import urllib.request
+          import urllib.parse
+          import base64
+          import boto3
+          import io
+          import math
+          import zipfile
+
+          codepipeline = boto3.client("codepipeline")
+          secrets_manager = boto3.client("secretsmanager")
+          ssm = boto3.client("ssm")
+
+
+          def _langfuse_request(method, path, host, auth_header, body=None):
+              """Make an authenticated request to the Langfuse API."""
+              url = f"{host.rstrip('/')}/api/public{path}"
+              data = json.dumps(body).encode() if body else None
+              req = urllib.request.Request(url, data=data, method=method)
+              req.add_header("Authorization", auth_header)
+              req.add_header("Content-Type", "application/json")
+              with urllib.request.urlopen(req, timeout=15) as resp:
+                  return json.loads(resp.read().decode())
+
+
+          def lambda_handler(event, context):
+              job_id = event["CodePipeline.job"]["id"]
+              try:
+                  # Retrieve Langfuse credentials from Secrets Manager
+                  secret_arn = os.environ["LANGFUSE_CREDENTIALS_SECRET"]
+                  secret_value = secrets_manager.get_secret_value(SecretId=secret_arn)
+                  creds = json.loads(secret_value["SecretString"])
+
+                  host = creds.get("host", "https://cloud.langfuse.com")
+                  auth = base64.b64encode(
+                      f"{creds['public_key']}:{creds['secret_key']}".encode()
+                  ).decode()
+                  auth_header = f"Basic {auth}"
+
+                  prompt_name = os.environ.get("PROMPT_NAME", "customer-support-system")
+                  encoded_name = urllib.parse.quote(prompt_name, safe="")
+
+                  # Read the exact evaluation approved by this pipeline execution.
+                  artifacts = event["CodePipeline.job"]["data"]["inputArtifacts"]
+                  if len(artifacts) != 1:
+                      raise ValueError("Expected one evaluation artifact")
+                  location = artifacts[0]["location"]["s3Location"]
+                  response = boto3.client("s3").get_object(
+                      Bucket=location["bucketName"], Key=location["objectKey"],
+                  )
+                  try:
+                      archive_bytes = response["Body"].read()
+                  finally:
+                      response["Body"].close()
+                  with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+                      evaluated = json.loads(archive.read("evaluation_results.json"))
+                  if evaluated.get("prompt_name") != prompt_name:
+                      raise ValueError("Evaluation artifact belongs to a different prompt")
+                  draft_version = evaluated["prompt_version"]
+                  avg_score = evaluated["avg_score"]
+                  if type(draft_version) is not int or draft_version < 1:
+                      raise ValueError("Missing evaluated prompt version")
+                  if not isinstance(avg_score, (int, float)) or not math.isfinite(avg_score) or not 0 <= avg_score <= 1:
+                      raise ValueError("Invalid evaluated score")
+                  prod = _langfuse_request(
+                      "GET", f"/v2/prompts/{encoded_name}?label=production", host, auth_header,
+                  )
+                  prod_version = prod["version"]
+
+                  # 2. Promote draft → production label
+                  # (Langfuse auto-removes "production" from old version)
+                  _langfuse_request(
+                      "PATCH",
+                      f"/v2/prompts/{encoded_name}/versions/{draft_version}",
+                      host, auth_header,
+                      body={"newLabels": ["production"]},
+                  )
+
+                  # Keep retries from deprecating the version just promoted.
+                  if prod_version != draft_version:
+                      _langfuse_request(
+                          "PATCH",
+                          f"/v2/prompts/{encoded_name}/versions/{prod_version}",
+                          host, auth_header, body={"newLabels": ["deprecated"]},
+                      )
+                  ssm.put_parameter(
+                      Name=os.environ["SSM_BASELINE_PARAM"], Value=str(avg_score),
+                      Type="String", Overwrite=True,
+                  )
+
+                  # 4. Report success to CodePipeline
+                  codepipeline.put_job_success_result(
+                      jobId=job_id,
+                      outputVariables={
+                          "promoted_version": str(draft_version),
+                          "prompt_name": prompt_name,
+                      },
+                  )
+                  return {
+                      "status": "PROMOTED",
+                      "prompt": prompt_name,
+                      "draft_version": draft_version,
+                      "old_prod_version": prod_version,
+                  }
+
+              except Exception as e:
+                  codepipeline.put_job_failure_result(
+                      jobId=job_id,
+                      failureDetails={"type": "JobFailed", "message": str(e)},
+                  )
+                  raise
+
+  # --- CodePipeline ---
+  PromptPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: prompt-evaluation-pipeline
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        # Stage 1: Source
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: '1'
+              Configuration:
+                RepositoryName: !Ref RepositoryName
+                BranchName: !Ref BranchName
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: SourceOutput
+
+        # Stage 2: Build and evaluate
+        - Name: BuildAndEvaluate
+          Actions:
+            - Name: RunEvaluation
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref EvaluationProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: EvalOutput
+
+        # Stage 3: Manual approval
+        - Name: Approval
+          Actions:
+            - Name: ManualApproval
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                CustomData: >
+                  Review evaluation results in Langfuse before
+                  deploying prompt to production.
+
+        # Stage 4: Deploy prompt (via Lambda)
+        - Name: Deploy
+          Actions:
+            - Name: DeployPrompt
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: '1'
+              Configuration:
+                FunctionName: !Ref DeployPromptLambda
+                UserParameters: !Sub |
+                  {"dataset": "${EvalDatasetName}", "threshold": ${ScoreThreshold}}
+              InputArtifacts:
+                - Name: EvalOutput
+
+  # --- IAM Roles ---
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: prompt-eval-codebuild-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InferenceOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/anthropic.claude-sonnet-5'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/anthropic.claude-opus-5'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/global.anthropic.claude-sonnet-5'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/global.anthropic.claude-opus-5'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/global.anthropic.claude-haiku-4-5-20251001-v1:0'
+        - PolicyName: CodeBuildBase
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub '${ArtifactBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - codebuild:CreateReportGroup
+                  - codebuild:CreateReport
+                  - codebuild:UpdateReport
+                  - codebuild:BatchPutTestCases
+                  - codebuild:BatchPutCodeCoverages
+                Resource: !Sub 'arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:report-group/*'
+        - PolicyName: SecretsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref LangfuseCredentials
+        - PolicyName: SSMParameterAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/prompt-pipeline/*'
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: prompt-eval-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ReadApprovedEvaluation
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub '${ArtifactBucket.Arn}/*'
+        - PolicyName: CodePipelineAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codepipeline:PutJobSuccessResult
+                  - codepipeline:PutJobFailureResult
+                Resource: '*'
+        - PolicyName: SecretsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref LangfuseCredentials
+        - PolicyName: SSMParameterAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/prompt-pipeline/*'
+
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: prompt-eval-pipeline-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PipelinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub '${ArtifactBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:UploadArchive
+                  - codecommit:GetUploadArchiveStatus
+                  - codecommit:CancelUploadArchive
+                Resource: !Sub 'arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${RepositoryName}'
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource: !GetAtt EvaluationProject.Arn
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt DeployPromptLambda.Arn
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  PipelineName:
+    Description: Name of the CodePipeline
+    Value: !Ref PromptPipeline
+
+  PipelineUrl:
+    Description: URL to view the pipeline in the AWS Console
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${PromptPipeline}/view'
+
+  EvaluationProjectName:
+    Description: Name of the CodeBuild evaluation project
+    Value: !Ref EvaluationProject
+
+  ArtifactBucketName:
+    Description: S3 bucket for pipeline artifacts
+    Value: !Ref ArtifactBucket
+
+  RepositoryCloneUrl:
+    Description: HTTPS clone URL for the CodeCommit repository
+    Value: !GetAtt PromptRepository.CloneUrlHttp
+
+  SecretName:
+    Description: Secrets Manager secret name for Langfuse credentials
+    Value: !Ref LangfuseCredentials

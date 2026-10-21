@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -40,6 +41,32 @@ def native_trace(documents, session_id):
         and doc.get("scope", {}).get("name") == "strands.telemetry.tracer"
     ]
     return trace_id, json.loads(json.dumps(spans, allow_nan=False))
+
+
+def prepare_evaluation_retry(row, evaluator_id):
+    """Retry service errors on cell rerun, retaining evidence and limiting attempts."""
+    response = row.get("evaluation")
+    if not response or not any(
+        result.get("errorCode") or result.get("errorMessage")
+        for result in response.get("evaluationResults", [])
+        if isinstance(result, dict)
+    ):
+        return False
+    if row.get("evaluated_by") != evaluator_id:
+        raise ValueError("Saved evaluation belongs to a different evaluator.")
+    attempts = row.setdefault("evaluation_attempts", [])
+    if len(attempts) >= 2:
+        raise ValueError("Evaluator failed three attempts. Inspect the saved responses before retrying.")
+    attempts.append({
+        "response": copy.deepcopy(response),
+        "seconds": row.get("evaluation_seconds", 0),
+        "evaluator_id": evaluator_id,
+    })
+    row["evaluation"] = None
+    row["evaluation_validated"] = False
+    row["evaluation_cost_usd"] = None
+    row.pop("score", None)
+    return True
 
 
 def checked_score(response, row, evaluator_id):

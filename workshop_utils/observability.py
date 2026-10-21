@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import re
 import threading
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping
@@ -296,6 +297,27 @@ def normalize_langfuse_spans(*, params: Any) -> Any:
                     ),
                 },
             )
+    # AgentCore's AWS resource label contains a colon. Langfuse accepts only
+    # lowercase letters, digits, underscores and hyphens for environments.
+    # Override the label in the Langfuse copy; never modify the AWS resource.
+    for identifier, span in params.spans.items():
+        if "langfuse.environment" in span.attributes:
+            continue
+        resource_environment = span.resource_attributes.get("deployment.environment.name")
+        if not isinstance(resource_environment, str) or not resource_environment.startswith("bedrock-agentcore:"):
+            continue
+        environment = "bedrock-agentcore-" + re.sub(
+            r"[^a-z0-9_-]", "-", resource_environment.split(":", 1)[1].lower()
+        )
+        previous = patches.get(identifier, OtelSpanPatch())
+        patches[identifier] = OtelSpanPatch(
+            delete_attributes=previous.delete_attributes,
+            set_attributes={
+                **previous.set_attributes,
+                "langfuse.environment": environment,
+                "langfuse.observation.metadata.aws_environment": resource_environment,
+            },
+        )
     return MaskOtelSpansResult(span_patches=patches)
 
 

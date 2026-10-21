@@ -161,6 +161,35 @@ def patch_batch(*pairs):
     return result.span_patches
 
 
+def test_agentcore_environment_is_compatible_only_in_langfuse_export():
+    from dataclasses import replace
+
+    identifier, span = batch_span(strands_attributes())
+    resource = MappingProxyType({"service.name": "test", "deployment.environment.name": "bedrock-agentcore:default"})
+    span = replace(span, resource_attributes=resource)
+    output = apply_patch(span, patch_batch((identifier, span))[identifier])
+    assert output["langfuse.environment"] == "bedrock-agentcore-default"
+    assert output["langfuse.observation.metadata.aws_environment"] == "bedrock-agentcore:default"
+    assert output[STATUS] == "canonical"
+    assert json.loads(output[USAGE])["input"] == 7
+    assert resource["deployment.environment.name"] == "bedrock-agentcore:default"
+    assert "langfuse.environment" not in span.attributes
+
+
+def test_environment_fix_preserves_aggregate_suppression_and_explicit_label():
+    from dataclasses import replace
+
+    attrs = {**strands_attributes(), "gen_ai.operation.name": "invoke_agent"}
+    identifier, span = batch_span(attrs, name="invoke_agent")
+    span = replace(span, resource_attributes={"deployment.environment.name": "bedrock-agentcore:default"})
+    output = apply_patch(span, patch_batch((identifier, span))[identifier])
+    assert output["langfuse.environment"] == "bedrock-agentcore-default"
+    assert output[STATUS] == "suppressed_aggregate"
+    assert "gen_ai.usage.input_tokens" not in output
+    explicit = replace(span, attributes={**attrs, "langfuse.environment": "review"})
+    assert apply_patch(explicit, patch_batch((identifier, explicit))[identifier])["langfuse.environment"] == "review"
+
+
 def test_strands_inclusive_input_and_aliases_normalize_once():
     attrs = strands_attributes()
     original = dict(attrs)

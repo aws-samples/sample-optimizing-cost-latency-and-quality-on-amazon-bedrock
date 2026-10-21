@@ -10,9 +10,9 @@ import os
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from strands import Agent
 from strands.models import BedrockModel
-from strands.telemetry import StrandsTelemetry
 
-from utils.agent_config import MODEL_SONNET, setup_langfuse_telemetry
+from utils.agent_config import MODEL_SONNET, assistant_text, model_settings, setup_langfuse_telemetry
+from utils.langfuse_setup import current_session_id
 from utils.tools import get_product_info, get_return_policy, get_technical_support, web_search
 
 setup_langfuse_telemetry()
@@ -201,14 +201,14 @@ you know whether to move on to the next step or try a different approach.
 @app.entrypoint
 def invoke(payload):
     user_input = payload.get("prompt", "")
+    session_id = current_session_id(payload)
 
-    telemetry = StrandsTelemetry()
-    telemetry.setup_otlp_exporter()
+    telemetry = setup_langfuse_telemetry()
 
     # Baseline: No optimizations (no max_tokens, no stop_sequences, no caching)
     model = BedrockModel(
         model_id=MODEL_SONNET,
-        temperature=0.3,
+        **model_settings(MODEL_SONNET, 0.3),
         region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
     )
 
@@ -218,15 +218,16 @@ def invoke(payload):
         system_prompt=SYSTEM_PROMPT,
         name="customer-support-v1-baseline",
         trace_attributes={
+            "session.id": session_id,
             "version": "v1-baseline",
             "langfuse.tags": ["baseline", "no-optimization"],
         },
     )
 
     response = agent(user_input)
-    response_text = response.message["content"][0]["text"]
+    response_text = assistant_text(response)
 
-    telemetry.tracer_provider.force_flush()
+    telemetry.flush()
 
     return response_text
 

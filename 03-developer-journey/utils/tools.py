@@ -9,7 +9,6 @@ import boto3
 from duckduckgo_search import DDGS
 from duckduckgo_search.exceptions import DuckDuckGoSearchException, RatelimitException
 from strands.tools import tool
-from strands_tools import retrieve
 
 
 @tool
@@ -272,24 +271,19 @@ def get_technical_support(issue_description: str) -> str:
 
         kb_id = ssm.get_parameter(Name=f"/{account_id}-{region}/kb/knowledge-base-id")["Parameter"]["Value"]
 
-        # Use strands retrieve tool to query Bedrock Knowledge Base
-        tool_use = {
-            "toolUseId": "tech_support_query",
-            "input": {
-                "text": issue_description,
-                "knowledgeBaseId": kb_id,
-                "region": region,
-                "numberOfResults": 3,
-                "score": 0.4,
-            },
-        }
-
-        result = retrieve.retrieve(tool_use)
-
-        if result["status"] == "success":
-            return result["content"][0]["text"]
-        else:
-            return f"Unable to access technical support documentation. Error: {result['content'][0]['text']}"
+        kind = ssm.get_parameter(Name="/app/customersupport/kb/type")["Parameter"]["Value"]
+        configuration = "managedSearchConfiguration" if kind == "managed" else "vectorSearchConfiguration"
+        response = boto3.client("bedrock-agent-runtime", region_name=region).retrieve(
+            knowledgeBaseId=kb_id,
+            retrievalQuery={"text": issue_description},
+            retrievalConfiguration={configuration: {"numberOfResults": 3}},
+        )
+        # Managed KB scores are not calibrated to the legacy vector-search cutoff.
+        hits = [hit for hit in response.get("retrievalResults", []) if kind == "managed" or hit.get("score", 0) >= 0.4]
+        return (
+            "\n\n".join(hit.get("content", {}).get("text", "") for hit in hits)
+            or "No relevant technical support documentation found."
+        )
 
     except Exception as e:
-        return f"Unable to access technical support documentation. Error: {e!s}"
+        raise RuntimeError("Unable to access technical support documentation") from e

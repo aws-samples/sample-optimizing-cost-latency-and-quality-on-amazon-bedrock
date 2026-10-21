@@ -22,6 +22,8 @@ dependencies = [
 
 [project.optional-dependencies]
 notebook = [
+    "bedrock-agentcore-starter-toolkit==0.3.14",
+    "duckduckgo-search==8.1.1",
     "aws-bedrock-token-generator==1.1.0",
     "ipykernel>=7,<8",
     "jupyter>=1.1,<2",
@@ -30,7 +32,7 @@ notebook = [
     "pandas>=3,<4",
     "matplotlib>=3.10,<4",
     "tabulate>=0.9,<1",
-    "openai==3.19.2",
+    "openai==2.54.0",
     "anthropic[bedrock]==1.8.0",
     "pip>=26,<27",
 ]

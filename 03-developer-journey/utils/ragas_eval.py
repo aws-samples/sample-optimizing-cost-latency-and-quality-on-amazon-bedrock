@@ -17,7 +17,7 @@ Judge + embeddings run on Bedrock via the langchain-aws wrappers (no OpenAI key)
 
 Stack (verified live against Bedrock -- see CONTEXT.md and
 docs/adr/0001-local-ragas-quality-evals.md):
-    ragas==0.4.0, langchain-aws, langchain-community==0.3.27
+    ragas==0.4.0, langchain-aws==0.2.35, langchain-community==0.3.27
 The legacy `ragas.metrics` API is used deliberately: the newer
 `ragas.metrics.collections` API reaches Bedrock via LiteLLM+Instructor, which
 sends temperature+top_p together and Claude Sonnet 4.5 rejects that.
@@ -36,25 +36,24 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, module="ragas")
 
 from ragas import SingleTurnSample
 from ragas.dataset_schema import MultiTurnSample
-from ragas.messages import AIMessage, HumanMessage
-from ragas.messages import ToolCall as RagasToolCall
+from ragas.messages import AIMessage, HumanMessage, ToolCall as RagasToolCall
 from ragas.metrics import (
     FactualCorrectness,
     LLMContextPrecisionWithReference,
     ToolCallAccuracy,
 )
 
-from utils.agent_config import MODEL_SONNET
+from utils.agent_config import MODEL_OPUS, model_settings
 
 
 # --------------------------------------------------------------------------
 # Judge / embeddings on Bedrock
 # --------------------------------------------------------------------------
-def build_bedrock_evaluator(judge_model_id: str = MODEL_SONNET, region: str | None = None):
+def build_bedrock_evaluator(judge_model_id: str = MODEL_OPUS, region: str | None = None):
     """Build a RAGAS judge LLM + embeddings backed by Amazon Bedrock.
 
     Returns (judge, embeddings) wrapped for the legacy ragas.metrics API.
-    Judge = ChatBedrockConverse (temperature 0 for stable grading), embeddings
+    Judge = ChatBedrockConverse with model-compatible controls, embeddings
     = Titan Text v2.
     """
     import os
@@ -65,7 +64,13 @@ def build_bedrock_evaluator(judge_model_id: str = MODEL_SONNET, region: str | No
 
     region = region or os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 
-    judge = LangchainLLMWrapper(ChatBedrockConverse(model=judge_model_id, region_name=region, temperature=0.0))
+    settings = model_settings(judge_model_id, 0.0)
+    if "additional_request_fields" in settings:
+        settings["additional_model_request_fields"] = settings.pop("additional_request_fields")
+    judge = LangchainLLMWrapper(
+        ChatBedrockConverse(model=judge_model_id, region_name=region, **settings),
+        bypass_temperature="additional_model_request_fields" in settings,
+    )
     embeddings = LangchainEmbeddingsWrapper(
         BedrockEmbeddings(model_id="amazon.titan-embed-text-v2:0", region_name=region)
     )
@@ -89,7 +94,7 @@ def invoke_and_capture(agent, query: str) -> dict:
     result = agent(query)
     response_text = ""
     try:
-        response_text = result.message["content"][0]["text"]
+        response_text = "".join(b["text"] for b in result.message["content"] if "text" in b)
     except (AttributeError, KeyError, IndexError, TypeError):
         response_text = str(getattr(result, "message", result))
 
@@ -215,7 +220,7 @@ def score_answer_correctness(query: str, answer: str, reference: str, judge, emb
     for _ in range(4):
         try:
             return _run_async(scorer.single_turn_ascore(sample))
-        except Exception as exc:  # noqa: BLE001 -- parser/transport flakes only
+        except Exception as exc:
             last_exc = exc
     print(f"      (factual_correctness unavailable after retries: {type(last_exc).__name__})")
     return None
@@ -263,46 +268,13 @@ def normalize_trace_tool_names(raw_names: list[str]) -> list[str]:
     return out
 
 
-def find_trace_id_by_query(
-    agent_trace_name: str, query: str, wait_seconds: int = 5, max_retries: int = 6
-) -> str | None:
-    """Find the trace_id for a SPECIFIC invocation, matched by its query text.
+def find_trace_id_by_query(agent_trace_name, query, wait_seconds=5, max_retries=6, *, session_id=None):
+    """Use the supplied invocation identity, not a query substring or project order."""
+    from utils.langfuse_metrics import get_latest_trace_metrics
 
-    `get_latest_trace_metrics` matches only by agent name and returns whatever
-    trace is newest — which mis-pairs scenarios when several run against the same
-    agent in quick succession (scenario A's reference scored against scenario B's
-    answer -> spurious 0). AgentCore's session id does not reach the Langfuse
-    trace, but the trace `input` carries the exact user query, so we correlate on
-    that. Returns the most recent trace whose name matches the agent AND whose
-    input contains `query`, or None.
-    """
-    import json
-    import os
-    import time
-
-    import httpx
-    from langfuse import Langfuse
-
-    langfuse = Langfuse(
-        public_key=os.environ.get("LANGFUSE_PUBLIC_KEY"),
-        secret_key=os.environ.get("LANGFUSE_SECRET_KEY"),
-        host=os.environ.get("LANGFUSE_BASE_URL", "https://cloud.langfuse.com"),
-        httpx_client=httpx.Client(timeout=30),
-    )
-    needle = query.strip()[:60]  # enough to disambiguate the 5 scenarios
-    for _ in range(max_retries):
-        time.sleep(wait_seconds)
-        try:
-            traces = langfuse.api.trace.list(limit=20).data
-        except Exception:
-            continue
-        for t in traces:
-            name = getattr(t, "name", "") or ""
-            if agent_trace_name not in name:
-                continue
-            if needle in json.dumps(getattr(t, "input", None) or "", default=str):
-                return t.id
-    return None
+    return get_latest_trace_metrics(
+        agent_name=agent_trace_name, session_id=session_id, wait_seconds=wait_seconds, max_retries=max_retries
+    )["trace_id"]
 
 
 def read_trace_for_eval(trace_id: str, region: str | None = None) -> dict:
@@ -315,48 +287,49 @@ def read_trace_for_eval(trace_id: str, region: str | None = None) -> dict:
     get_technical_support, when present.
     """
     import json
-    import os
 
-    import httpx
-    from langfuse import Langfuse
+    from utils.langfuse_metrics import trace_reader
 
-    public_key = os.environ.get("LANGFUSE_PUBLIC_KEY")
-    secret_key = os.environ.get("LANGFUSE_SECRET_KEY")
-    host = os.environ.get("LANGFUSE_BASE_URL", "https://cloud.langfuse.com")
-    langfuse = Langfuse(
-        public_key=public_key,
-        secret_key=secret_key,
-        host=host,
-        httpx_client=httpx.Client(timeout=60),
-    )
-
-    full = langfuse.api.trace.get(trace_id)
+    full = trace_reader().trace.get(trace_id, request_options={"max_retries": 0, "timeout_in_seconds": 30})
     observations = getattr(full, "observations", []) or []
 
     def _to_text(value):
-        """Coerce a Strands/AgentCore output payload to the final answer text.
-
-        The answer lands in a `message` field that is EITHER a plain string
-        (AGENT obs / trace output) OR a JSON-encoded list of content blocks like
-        `[{"text": "..."}, {"toolUse": ...}]` (GENERATION obs). Returns "" if the
-        payload is a tool-use turn (no answer text).
-        """
+        """Read supported trace output shapes, excluding tool proposals and reasoning."""
         if isinstance(value, str):
-            value = {"message": value}
-        if not isinstance(value, dict):
-            return ""
-        msg = value.get("message")
-        if isinstance(msg, str):
-            stripped = msg.lstrip()
-            if stripped.startswith("[") or stripped.startswith("{"):
+            if value.lstrip().startswith(("[", "{")):
                 try:
-                    blocks = json.loads(msg)
-                    texts = [b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("text")]
-                    return "\n".join(t for t in texts if t)
-                except (ValueError, TypeError):
-                    return msg  # not JSON after all -> it's plain prose
-            return msg  # plain answer string
-        return value.get("response") or value.get("text") or ""
+                    parsed = json.loads(value)
+                except ValueError:
+                    return value
+                text = _to_text(parsed)
+                shaped = isinstance(parsed, list) or (
+                    isinstance(parsed, dict)
+                    and (
+                        any(
+                            key in parsed
+                            for key in ("message", "response", "text", "content", "parts", "toolUse", "body")
+                        )
+                        or parsed.get("type") in ("tool_use", "tool_call")
+                    )
+                )
+                return text if shaped or text else value
+            return value
+        if isinstance(value, list):
+            if any(
+                isinstance(block, dict) and ("toolUse" in block or block.get("type") in ("tool_use", "tool_call"))
+                for block in value
+            ):
+                return ""
+            return "\n".join(text for block in value if (text := _to_text(block)))
+        if isinstance(value, dict):
+            if isinstance(value.get("statusCode"), int) and 200 <= value["statusCode"] < 300 and "body" in value:
+                return _to_text(value["body"])
+            if "toolUse" in value or value.get("type") in ("tool_use", "tool_call"):
+                return ""
+            for key in ("message", "response", "text", "content", "parts"):
+                if key in value:
+                    return _to_text(value[key])
+        return ""
 
     response_text = ""
     raw_tool_names: list[str] = []
@@ -365,35 +338,41 @@ def read_trace_for_eval(trace_id: str, region: str | None = None) -> dict:
     # Final answer = the trace's top-level output (carries the agent's last message).
     response_text = _to_text(getattr(full, "output", None))
 
+    # Prefer the latest completed answer when the trace-level output is delayed.
+    ordered = sorted(
+        observations,
+        key=lambda o: getattr(o, "start_time", None) or _dt.datetime.min.replace(tzinfo=_dt.UTC),
+        reverse=True,
+    )
+    if not response_text:
+        for o in ordered:
+            if getattr(o, "type", "") == "AGENT" or (getattr(o, "name", "") or "").startswith("invoke_agent"):
+                response_text = _to_text(getattr(o, "output", None))
+                if response_text:
+                    break
+    if not response_text:
+        for o in ordered:
+            if getattr(o, "type", "") == "GENERATION":
+                response_text = _to_text(getattr(o, "output", None))
+                if response_text:
+                    break
+
     for o in observations:
         otype = getattr(o, "type", "")
         oname = getattr(o, "name", "") or ""
         out = getattr(o, "output", None)
-        blob = json.dumps(out, default=str) if out is not None else ""
 
         # Every TOOL observation is one tool call; its name carries the tool.
         if otype == "TOOL":
             raw_tool_names.append(oname)
             # Retrieved KB chunks: the get_technical_support tool's result text.
             if "technical_support" in oname:
-                try:
-                    msg = out.get("message") if isinstance(out, dict) else None
-                    if msg:
-                        for blk in json.loads(msg):
-                            if isinstance(blk, dict) and blk.get("text"):
-                                retrieved_contexts.append(blk["text"])
-                except (ValueError, TypeError, AttributeError):
-                    if blob:
-                        retrieved_contexts.append(blob)
+                context_text = _to_text(out)
+                if context_text:
+                    retrieved_contexts.append(context_text)
 
-        # Fallbacks for the answer if the trace output was empty: the AGENT
-        # observation carries the same final message; a final GENERATION
-        # (end_turn / stop, not tool_use) carries it as content blocks.
-        if not response_text and otype == "AGENT":
-            response_text = _to_text(out)
-        if not response_text and otype == "GENERATION" and '"tool_use"' not in blob:
-            response_text = _to_text(out)
-
+    if not response_text.strip():
+        raise ValueError("Trace has no final answer; do not score an empty response")
     return {
         "response": response_text,
         "tool_calls": normalize_trace_tool_names(raw_tool_names),
@@ -430,7 +409,7 @@ def push_scores_to_langfuse(trace_id: str, scores: dict[str, float]) -> None:
         {
             "id": str(_uuid.uuid4()),
             "type": "score-create",
-            "timestamp": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "timestamp": _dt.datetime.now(_dt.UTC).isoformat(),
             "body": {
                 "id": str(_uuid.uuid4()),
                 "traceId": trace_id,

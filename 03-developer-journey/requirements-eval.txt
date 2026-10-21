@@ -1,13 +1,16 @@
 # Quality-evaluation dependencies for Lab 07 (RAGAS metrics).
 # Installed in the notebook kernel only -- NOT baked into the deployed agent
-# containers (those use requirements-for-agentcore.txt). The RAGAS eval runs the
-# agents locally in-notebook, so these live with the notebook, not the runtime.
+# containers (those use requirements-for-agentcore.txt). The RAGAS judge runs
+# in the notebook and assesses answers from the deployed agents.
 #
-# Versions are pinned: this exact combination is verified working against a
-# Bedrock judge (Claude Sonnet 4.5 + Titan embeddings). See CONTEXT.md.
+# Pinned dependencies for the Bedrock judge (Claude Opus 5 + Titan embeddings).
 #  - ragas.metrics.collections (newer API) is NOT used: its LiteLLM+Instructor
 #    judge sends temperature+top_p together, which Claude 4.5 rejects.
 #  - langchain-community must stay <0.3.30 or RAGAS's ChatVertexAI import breaks.
 ragas==0.4.0
-langchain-aws>=0.2.0
+langchain-aws==0.2.35
+langchain-core==0.3.86
 langchain-community==0.3.27
+langchain==0.3.30
+langchain-openai==0.3.35
+openai==2.54.0
