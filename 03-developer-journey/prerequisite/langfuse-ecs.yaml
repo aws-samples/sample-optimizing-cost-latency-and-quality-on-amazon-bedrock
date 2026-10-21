@@ -837,7 +837,7 @@ Resources:
                   - cognito-idp:AdminSetUserPassword
                   - cognito-idp:AdminDeleteUser
                   - cognito-idp:AdminGetUser
-                Resource: '*'
+                Resource: !Sub 'arn:${AWS::Partition}:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${SampleDeployment.LangfuseDemo.CognitoUserPoolId}'
         - PolicyName: SecretsManagerAccess
           PolicyDocument:
             Version: '2012-10-17'
